@@ -17,9 +17,11 @@ try
         return 0;
     }
 
-    var configuredMdbPath = !string.IsNullOrWhiteSpace(options.MdbPath)
-        ? options.MdbPath
-        : Environment.GetEnvironmentVariable("MDB_PATH");
+    var configuredMdbPath = options.Tui
+        ? Environment.GetEnvironmentVariable("MDB_PATH")
+        : !string.IsNullOrWhiteSpace(options.MdbPath)
+            ? options.MdbPath
+            : Environment.GetEnvironmentVariable("MDB_PATH");
     if (string.IsNullOrWhiteSpace(configuredMdbPath))
         throw new ArgumentException(
             "Укажите путь к MDB через --mdb <путь> или переменную MDB_PATH.");
@@ -28,10 +30,14 @@ try
     if (!File.Exists(mdbPath))
         throw new FileNotFoundException("MDB-файл не найден.", mdbPath);
 
+    using var connection = OpenAccessDatabase(mdbPath, options.Provider);
+
+    if (options.Tui)
+        return await IncrementalTui.RunAsync(
+            connection, mdbPath, ResolvePostgresConnectionString(options), options);
+
     Console.WriteLine($"MDB: {mdbPath}");
     Console.WriteLine($"Размер: {new FileInfo(mdbPath).Length:N0} байт");
-
-    using var connection = OpenAccessDatabase(mdbPath, options.Provider);
     Console.WriteLine($"Провайдер: {connection.Provider}");
     Console.WriteLine("Подключение: OK\n");
 
@@ -483,6 +489,7 @@ sealed record Options(
     int DeltaMaxChanges,
     bool SkipRecalculate,
     bool SkipRefreshViews,
+    bool Tui,
     bool ShowHelp)
 {
     public static Options Parse(string[] args)
@@ -521,6 +528,7 @@ sealed record Options(
         var deltaMaxChanges = 100_000;
         var skipRecalculate = false;
         var skipRefreshViews = false;
+        var tui = false;
         var showHelp = false;
 
         for (var index = 0; index < args.Length; index++)
@@ -564,6 +572,7 @@ sealed record Options(
                 case "--delta-max-changes": deltaMaxChanges = ParsePositive(NextValue(args, ref index, "--delta-max-changes"), "--delta-max-changes"); break;
                 case "--skip-recalculate": skipRecalculate = true; break;
                 case "--skip-refresh-views": skipRefreshViews = true; break;
+                case "--tui": tui = true; break;
                 case "--help" or "-h": showHelp = true; break;
                 default: throw new ArgumentException($"Неизвестный аргумент: {args[index]}");
             }
@@ -576,6 +585,10 @@ sealed record Options(
             throw new ArgumentException("--publish-hosting совместим только с --migrate или отдельным запуском.");
         if (syncHosting && !incremental)
             throw new ArgumentException("--sync-hosting используется вместе с --incremental.");
+        if (tui && (fullMigration || incremental || copyToPostgres || publishHosting || syncHosting))
+            throw new ArgumentException("--tui запускается отдельно и сам включает инкрементальную публикацию.");
+        if (tui && !string.IsNullOrWhiteSpace(mdbPath))
+            throw new ArgumentException("--tui использует только MDB_PATH; не задавайте --mdb.");
 
         return new Options(mdbPath, table, limit, countRows, provider, copyToPostgres,
             pgConnectionString, pgSchema, pgTable, copyLimit, replace, fullMigration,
@@ -584,7 +597,7 @@ sealed record Options(
             transferRetries, zstdLevel, pgDatabase, pgAdminDatabase, sqlDirectory, migrationLimit,
             mdbDateOffsetHours, confirmDrop, periodDays, idOverlap, paymentIdOverlap,
             invoiceDataIdOverlap, fullCustomers, deltaMaxChanges, skipRecalculate,
-            skipRefreshViews, showHelp);
+            skipRefreshViews, tui, showHelp);
     }
 
     public static void PrintHelp()
@@ -627,6 +640,10 @@ sealed record Options(
               --transfer-work-dir <путь> Рабочий каталог; по умолчанию системный TEMP
               --transfer-retries <N>     Попытки SFTP-докачки, по умолчанию 20
               --zstd-level <1..22>       Уровень сжатия, по умолчанию 17
+
+            Интерактивный режим:
+              --tui                      Инкрементальная публикация на хостинг с TUI
+                                         (MDB берётся только из MDB_PATH)
 
             Инкрементальная выгрузка в локальный PostgreSQL:
               --incremental, --delta     Применить безопасную INSERT/UPDATE-дельту

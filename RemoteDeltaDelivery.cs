@@ -124,7 +124,8 @@ internal static class RemoteDeltaDelivery
         string packageRoot,
         MigrationSchema schema,
         bool recalculate,
-        bool refreshViews)
+        bool refreshViews,
+        Action<string>? stageChanged = null)
     {
         var timer = Stopwatch.StartNew();
         var pending = new List<string>();
@@ -152,7 +153,7 @@ internal static class RemoteDeltaDelivery
             Console.WriteLine($"Повторная доставка pending-пакета: {patchId}");
             var package = await LoadPackageAsync(packageRoot, patchId);
             await DeliverAndRecordAsync(
-                local, hostingConnectionString, package, schema, recalculate, refreshViews);
+                local, hostingConnectionString, package, schema, recalculate, refreshViews, stageChanged);
         }
     }
 
@@ -162,7 +163,8 @@ internal static class RemoteDeltaDelivery
         DeltaPackage package,
         MigrationSchema schema,
         bool recalculate,
-        bool refreshViews)
+        bool refreshViews,
+        Action<string>? stageChanged = null)
     {
         var totalTimer = Stopwatch.StartNew();
         var phaseTimer = Stopwatch.StartNew();
@@ -174,7 +176,7 @@ internal static class RemoteDeltaDelivery
             await MarkDeliveryAttemptAsync(local, package.PatchId, "applying", null);
             LogProfile(package.PatchId, "Локальная отметка applying", phaseTimer);
 
-            await ApplyAsync(hostingConnectionString, package, schema, recalculate, refreshViews);
+            await ApplyAsync(hostingConnectionString, package, schema, recalculate, refreshViews, stageChanged);
 
             phaseTimer.Restart();
             await MarkDeliveryAttemptAsync(local, package.PatchId, "applied", null, applied: true);
@@ -237,9 +239,11 @@ internal static class RemoteDeltaDelivery
         DeltaPackage package,
         MigrationSchema schema,
         bool recalculate,
-        bool refreshViews)
+        bool refreshViews,
+        Action<string>? stageChanged)
     {
         var phaseTimer = Stopwatch.StartNew();
+        stageChanged?.Invoke("Подключение к PostgreSQL хостинга");
         await using var hosting = new NpgsqlConnection(connectionString);
         await hosting.OpenAsync();
         LogProfile(package.PatchId, "Подключение к PostgreSQL хостинга", phaseTimer,
@@ -281,6 +285,7 @@ internal static class RemoteDeltaDelivery
 
         await EnsureOperationsPrimaryKeyAsync(hosting, transaction);
 
+        stageChanged?.Invoke("Загрузка данных на хостинг");
         foreach (var table in Tables)
         {
             phaseTimer.Restart();
@@ -326,6 +331,7 @@ internal static class RemoteDeltaDelivery
 
         if (recalculate && package.AffectedPairs.Count > 0)
         {
+            stageChanged?.Invoke("Замена финансовых операций на хостинге");
             phaseTimer.Restart();
             if (package.FormatVersion >= 2)
             {
@@ -354,13 +360,17 @@ internal static class RemoteDeltaDelivery
 
         var totalChanges = package.Counts.Values.Sum(value => value.Inserted + value.Updated);
         if (refreshViews && totalChanges > 0)
+        {
+            stageChanged?.Invoke("Обновление представлений на хостинге");
             foreach (var view in new[] { "payers", "sellers", "invoices", "counterparties", "balances", "debt_invoices" })
             {
                 phaseTimer.Restart();
                 await ExecuteAsync(hosting, transaction, $"REFRESH MATERIALIZED VIEW bergapp.{Quote(view)}");
                 LogProfile(package.PatchId, $"REFRESH на хостинге: {view}", phaseTimer);
             }
+        }
 
+        stageChanged?.Invoke("Фиксация и проверка публикации");
         phaseTimer.Restart();
 
         await using (var command = hosting.CreateCommand())

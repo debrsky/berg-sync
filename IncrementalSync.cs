@@ -14,7 +14,7 @@ internal static class IncrementalSync
     private static readonly string[] MaxIdTables =
         ["Customers", "Applications", "XInvoices", "XInvoicePays", "XInvoiceDatas"];
 
-    public static async Task RunAsync(
+    public static async Task<IncrementalSyncResult> RunAsync(
         OleDbConnection access,
         string baseConnectionString,
         string databaseName,
@@ -29,14 +29,19 @@ internal static class IncrementalSync
         bool refreshViews,
         string sourcePath,
         bool syncHosting,
-        string? packageDirectory)
+        string? packageDirectory,
+        Action<string>? stageChanged = null)
     {
+        void Stage(string name) => stageChanged?.Invoke(name);
+
         var timer = Stopwatch.StartNew();
+        Stage("Загрузка конфигурации");
         var schema = LoadSchema();
         ValidateSchema(schema);
 
         var builder = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = databaseName };
         await using var postgres = new NpgsqlConnection(builder.ConnectionString);
+        Stage("Подключение к локальной PostgreSQL");
         await postgres.OpenAsync();
         Console.WriteLine("\nИНКРЕМЕНТАЛЬНАЯ ВЫГРУЗКА MDB → локальный PostgreSQL");
         Console.WriteLine($"  назначение: {postgres.Host}/{postgres.Database}");
@@ -46,6 +51,7 @@ internal static class IncrementalSync
         Console.WriteLine("  удаления: не применяются");
 
         var phaseTimer = Stopwatch.StartNew();
+        Stage("Подготовка локальной базы");
         await EnsureTargetAsync(postgres, schema);
         LogProfile("Подготовка локальной базы", phaseTimer);
 
@@ -57,12 +63,14 @@ internal static class IncrementalSync
             if (string.IsNullOrWhiteSpace(hostingConnectionString))
                 throw new ArgumentException("Для --sync-hosting задайте PG_HOSTING_CONNECTION_STRING.");
             phaseTimer.Restart();
+            Stage("Проверка отложенных публикаций");
             await RemoteDeltaDelivery.DeliverPendingAsync(
-                postgres, hostingConnectionString, packageRoot, schema, recalculate, refreshViews);
+                postgres, hostingConnectionString, packageRoot, schema, recalculate, refreshViews, stageChanged);
             LogProfile("Проверка и доставка отложенных пакетов", phaseTimer);
         }
 
         phaseTimer.Restart();
+        Stage("Поиск изменений в MDB");
         var targetMax = await ReadTargetMaxIdsAsync(postgres);
         var sourceMax = ReadSourceMaxIds(access);
         ValidateFreshness(sourceMax, targetMax);
@@ -154,6 +162,7 @@ internal static class IncrementalSync
             StringComparer.OrdinalIgnoreCase);
         string? packagePath = null;
 
+        Stage("Применение изменений к локальной базе");
         foreach (var table in DataTables)
         {
             phaseTimer.Restart();
@@ -165,6 +174,7 @@ internal static class IncrementalSync
 
         if (recalculate && affectedPairs > 0)
         {
+            Stage("Пересчёт финансовых операций");
             Console.WriteLine($"Пересчёт финансовых пар: {affectedPairs:N0}");
             phaseTimer.Restart();
             if (affectedPairs <= 500)
@@ -190,6 +200,7 @@ internal static class IncrementalSync
 
         if (syncHosting)
         {
+            Stage("Создание delta-пакета");
             packagePath = await RemoteDeltaDelivery.WritePackageAsync(
                 packageRoot, patchId, state.BaselineId, state.DeltaSeq, nextSeq,
                 sourcePath, periodStart, dateOffsetHours, changedRows,
@@ -200,6 +211,7 @@ internal static class IncrementalSync
 
         if (refreshViews && totalChanges > 0)
         {
+            Stage("Обновление локальных представлений");
             Console.WriteLine("Обновление materialized views...");
             foreach (var view in new[] { "payers", "sellers", "invoices", "counterparties", "balances", "debt_invoices" })
             {
@@ -262,14 +274,16 @@ internal static class IncrementalSync
 
         LogProfile("Запись метаданных локального патча", phaseTimer);
         phaseTimer.Restart();
+        Stage("Фиксация локального патча");
         await transaction.CommitAsync();
         LogProfile("COMMIT локального патча", phaseTimer);
 
         if (syncHosting)
         {
+            Stage("Публикация на хостинг");
             var package = await RemoteDeltaDelivery.LoadPackageAsync(packageRoot, patchId);
             await RemoteDeltaDelivery.DeliverAndRecordAsync(
-                postgres, hostingConnectionString!, package, schema, recalculate, refreshViews);
+                postgres, hostingConnectionString!, package, schema, recalculate, refreshViews, stageChanged);
         }
 
         timer.Stop();
@@ -278,6 +292,9 @@ internal static class IncrementalSync
         Console.WriteLine(syncHosting
             ? "Тот же пакет применён на хостинге."
             : "На хостинг данные не отправлялись.");
+        Stage("Завершено");
+        return new IncrementalSyncResult(
+            patchId, state.BaselineId, nextSeq, totalChanges, affectedPairs, timer.Elapsed, syncHosting);
     }
 
     private static void LogProfile(string operation, Stopwatch stopwatch, string? details = null)
@@ -851,3 +868,12 @@ internal static class IncrementalSync
     private sealed record ChangeCount(long Inserted, long Updated);
     private sealed record SyncState(string BaselineId, long DeltaSeq, double DateOffsetHours);
 }
+
+internal sealed record IncrementalSyncResult(
+    string PatchId,
+    string BaselineId,
+    long DeltaSeq,
+    long TotalChanges,
+    int AffectedPairs,
+    TimeSpan Elapsed,
+    bool PublishedToHosting);
