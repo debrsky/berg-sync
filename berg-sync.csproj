@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>BergSync</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.1" />
+    <PackageReference Include="System.Data.OleDb" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="migration-schema.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="sql\**\*.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
