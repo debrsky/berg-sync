@@ -9,6 +9,7 @@ Console.OutputEncoding = Encoding.UTF8;
 
 try
 {
+    EnvironmentFile.Load();
     var options = Options.Parse(args);
     if (options.ShowHelp)
     {
