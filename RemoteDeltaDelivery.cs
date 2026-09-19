@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -10,6 +12,17 @@ internal static class RemoteDeltaDelivery
 {
     private static readonly string[] Tables =
         ["Bosses", "Cargos", "Cars", "Customers", "Tariffs", "Applications", "XInvoices", "XInvoicePays", "XInvoiceDatas"];
+    private const string OperationsFileName = "operations.copy.gz";
+    private const string OperationsColumns = """
+        op_seq_num,id_seller,id_payer,op_date,op_date_ts,op_type,id_invoice,inv_amount,op_amount,
+        balance_before,charge_amount,payment_amount,balance_after,prepayment_before,prepayment_added,
+        prepayment_applied,prepayment_after,inv_debt_before,inv_debt_after,debt_invoices_before,debt_invoices_after
+        """;
+    private const string OperationsSelectColumns = """
+        o.op_seq_num,o.id_seller,o.id_payer,o.op_date,o.op_date_ts,o.op_type,o.id_invoice,o.inv_amount,o.op_amount,
+        o.balance_before,o.charge_amount,o.payment_amount,o.balance_after,o.prepayment_before,o.prepayment_added,
+        o.prepayment_applied,o.prepayment_after,o.inv_debt_before,o.inv_debt_after,o.debt_invoices_before,o.debt_invoices_after
+        """;
 
     public static string ResolvePackageRoot(string? configured)
     {
@@ -32,12 +45,16 @@ internal static class RemoteDeltaDelivery
         IReadOnlyList<AffectedPair> affectedPairs,
         IReadOnlyDictionary<string, DeltaTableCount> counts,
         IReadOnlyDictionary<string, long> sourceMaxIds,
-        MigrationSchema schema)
+        MigrationSchema schema,
+        NpgsqlConnection local,
+        NpgsqlTransaction transaction,
+        bool includeOperations)
     {
         var totalTimer = Stopwatch.StartNew();
         var phaseTimer = Stopwatch.StartNew();
         var package = new DeltaPackage
         {
+            FormatVersion = includeOperations ? 2 : 1,
             PatchId = patchId,
             BaselineId = baselineId,
             FromDeltaSeq = fromSeq,
@@ -65,6 +82,24 @@ internal static class RemoteDeltaDelivery
 
         var directory = Path.Combine(root, patchId);
         Directory.CreateDirectory(directory);
+        if (includeOperations)
+        {
+            phaseTimer.Restart();
+            var operationsPath = Path.Combine(directory, OperationsFileName);
+            var temporaryOperationsPath = operationsPath + ".tmp";
+            package.OperationsRowCount = await ScalarInt64Async(local, transaction, """
+                SELECT count(*)
+                FROM bergapp.operations o
+                JOIN delta_affected_pairs p USING (id_payer,id_seller)
+                """);
+            await ExportOperationsAsync(local, temporaryOperationsPath);
+            File.Move(temporaryOperationsPath, operationsPath, overwrite: true);
+            package.OperationsFile = OperationsFileName;
+            package.OperationsSha256 = await CalculateSha256Async(operationsPath);
+            LogProfile(patchId, "Выгрузка operations в пакет", phaseTimer,
+                $"строк: {package.OperationsRowCount:N0}; размер: {new FileInfo(operationsPath).Length:N0} байт");
+        }
+
         var packagePath = Path.Combine(directory, "package.json");
         var temporaryPath = packagePath + ".tmp";
         phaseTimer.Restart();
@@ -178,8 +213,21 @@ internal static class RemoteDeltaDelivery
         phaseTimer.Restart();
         var package = JsonSerializer.Deserialize<DeltaPackage>(await File.ReadAllTextAsync(packagePath))
                       ?? throw new InvalidOperationException($"Не удалось прочитать пакет {patchId}.");
+        package.PackageDirectory = directory;
+        if (package.FormatVersion >= 2)
+        {
+            if (!string.Equals(package.OperationsFile, OperationsFileName, StringComparison.Ordinal) ||
+                string.IsNullOrWhiteSpace(package.OperationsSha256))
+                throw new InvalidOperationException($"В пакете {patchId} отсутствует корректный снимок operations.");
+            var operationsPath = Path.Combine(directory, package.OperationsFile!);
+            if (!File.Exists(operationsPath))
+                throw new FileNotFoundException($"Не найден снимок operations пакета {patchId}.", operationsPath);
+            var operationsChecksum = await CalculateSha256Async(operationsPath);
+            if (!string.Equals(operationsChecksum, package.OperationsSha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Не совпадает SHA-256 снимка operations пакета {patchId}.");
+        }
         LogProfile(patchId, "Чтение и десериализация пакета", phaseTimer,
-            $"строк: {package.Tables.Values.Sum(table => table.Count):N0}");
+            $"строк: {package.Tables.Values.Sum(table => table.Count):N0}; operations: {package.OperationsRowCount:N0}");
         LogProfile(patchId, "Загрузка пакета — всего", totalTimer);
         return package;
     }
@@ -231,6 +279,8 @@ internal static class RemoteDeltaDelivery
         if (current.BaselineId != package.BaselineId || current.DeltaSeq != package.FromDeltaSeq)
             throw new InvalidOperationException("Состояние хостинга изменилось во время ожидания блокировки.");
 
+        await EnsureOperationsPrimaryKeyAsync(hosting, transaction);
+
         foreach (var table in Tables)
         {
             phaseTimer.Restart();
@@ -277,24 +327,29 @@ internal static class RemoteDeltaDelivery
         if (recalculate && package.AffectedPairs.Count > 0)
         {
             phaseTimer.Restart();
-            await ExecuteAsync(hosting, transaction, """
-                CREATE INDEX IF NOT EXISTS operations_payer_seller_idx
-                ON bergapp.operations (id_payer,id_seller)
-                """);
-            if (package.AffectedPairs.Count <= 500)
-                await ExecuteAsync(hosting, transaction, """
-                    DO $body$
-                    DECLARE pair record;
-                    BEGIN
-                      FOR pair IN SELECT id_payer,id_seller FROM delta_affected_pairs LOOP
-                        CALL bergapp.calculate_and_save_operations(pair.id_payer,pair.id_seller);
-                      END LOOP;
-                    END $body$
-                    """);
+            if (package.FormatVersion >= 2)
+            {
+                await ReplaceOperationsAsync(hosting, transaction, package);
+                LogProfile(package.PatchId, "Замена operations на хостинге", phaseTimer,
+                    $"пар: {package.AffectedPairs.Count:N0}; строк: {package.OperationsRowCount:N0}");
+            }
             else
-                await ExecuteAsync(hosting, transaction, "CALL bergapp.calculate_and_save_operations()");
-            LogProfile(package.PatchId, "Пересчёт operations на хостинге", phaseTimer,
-                $"пар: {package.AffectedPairs.Count:N0}");
+            {
+                if (package.AffectedPairs.Count <= 500)
+                    await ExecuteAsync(hosting, transaction, """
+                        DO $body$
+                        DECLARE pair record;
+                        BEGIN
+                          FOR pair IN SELECT id_payer,id_seller FROM delta_affected_pairs LOOP
+                            CALL bergapp.calculate_and_save_operations(pair.id_payer,pair.id_seller);
+                          END LOOP;
+                        END $body$
+                        """);
+                else
+                    await ExecuteAsync(hosting, transaction, "CALL bergapp.calculate_and_save_operations()");
+                LogProfile(package.PatchId, "Пересчёт operations на хостинге (legacy-пакет)", phaseTimer,
+                    $"пар: {package.AffectedPairs.Count:N0}");
+            }
         }
 
         var totalChanges = package.Counts.Values.Sum(value => value.Inserted + value.Updated);
@@ -370,6 +425,91 @@ internal static class RemoteDeltaDelivery
         LogProfile(package.PatchId, "Проверка результата публикации", phaseTimer,
             $"состояние: {appliedState.BaselineId}/{appliedState.DeltaSeq}");
         Console.WriteLine($"Пакет {package.PatchId} применён на хостинге.");
+    }
+
+    private static async Task ExportOperationsAsync(NpgsqlConnection connection, string path)
+    {
+        await using var source = await connection.BeginRawBinaryCopyAsync($"""
+            COPY (
+              SELECT {OperationsSelectColumns}
+              FROM bergapp.operations o
+              JOIN delta_affected_pairs p USING (id_payer,id_seller)
+              ORDER BY o.id_seller,o.id_payer,o.op_seq_num
+            ) TO STDOUT (FORMAT BINARY)
+            """);
+        await using var file = File.Create(path);
+        await using var compressed = new GZipStream(file, CompressionLevel.SmallestSize);
+        await source.CopyToAsync(compressed);
+    }
+
+    private static async Task ReplaceOperationsAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, DeltaPackage package)
+    {
+        await ExecuteAsync(connection, transaction,
+            "CREATE TEMP TABLE delta_operations (LIKE bergapp.operations INCLUDING DEFAULTS) ON COMMIT DROP");
+
+        var path = Path.Combine(package.PackageDirectory, package.OperationsFile!);
+        await using (var file = File.OpenRead(path))
+        await using (var decompressed = new GZipStream(file, CompressionMode.Decompress))
+        await using (var target = await connection.BeginRawBinaryCopyAsync(
+                         $"COPY delta_operations ({OperationsColumns}) FROM STDIN (FORMAT BINARY)"))
+            await decompressed.CopyToAsync(target);
+
+        var actualRows = await ScalarInt64Async(connection, transaction, "SELECT count(*) FROM delta_operations");
+        if (actualRows != package.OperationsRowCount)
+            throw new InvalidOperationException(
+                $"Снимок operations содержит {actualRows:N0} строк вместо {package.OperationsRowCount:N0}.");
+
+        await ExecuteAsync(connection, transaction, """
+            DELETE FROM bergapp.operations o
+            USING delta_affected_pairs p
+            WHERE o.id_payer=p.id_payer AND o.id_seller=p.id_seller;
+            INSERT INTO bergapp.operations (
+              op_seq_num,id_seller,id_payer,op_date,op_date_ts,op_type,id_invoice,inv_amount,op_amount,
+              balance_before,charge_amount,payment_amount,balance_after,prepayment_before,prepayment_added,
+              prepayment_applied,prepayment_after,inv_debt_before,inv_debt_after,debt_invoices_before,debt_invoices_after
+            )
+            SELECT
+              op_seq_num,id_seller,id_payer,op_date,op_date_ts,op_type,id_invoice,inv_amount,op_amount,
+              balance_before,charge_amount,payment_amount,balance_after,prepayment_before,prepayment_added,
+              prepayment_applied,prepayment_after,inv_debt_before,inv_debt_after,debt_invoices_before,debt_invoices_after
+            FROM delta_operations;
+            """);
+    }
+
+    internal static async Task EnsureOperationsPrimaryKeyAsync(
+        NpgsqlConnection connection, NpgsqlTransaction? transaction = null)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandTimeout = 0;
+        command.CommandText = """
+            DO $body$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid='bergapp.operations'::regclass AND contype='p'
+              ) THEN
+                ALTER TABLE bergapp.operations
+                  ALTER COLUMN id_seller SET NOT NULL,
+                  ALTER COLUMN id_payer SET NOT NULL,
+                  ALTER COLUMN op_seq_num SET NOT NULL;
+                ALTER TABLE bergapp.operations
+                  ADD CONSTRAINT operations_pkey PRIMARY KEY (id_seller,id_payer,op_seq_num);
+              END IF;
+            END $body$;
+            DROP INDEX IF EXISTS bergapp.operations_payer_seller_idx;
+            """;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> ScalarInt64Async(
+        NpgsqlConnection connection, NpgsqlTransaction transaction, string sql)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        return Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
     }
 
     private static async Task CopyRowsAsync(
@@ -538,6 +678,7 @@ internal static class RemoteDeltaDelivery
 
 internal sealed class DeltaPackage
 {
+    public int FormatVersion { get; init; } = 1;
     public string PatchId { get; init; } = string.Empty;
     public string BaselineId { get; init; } = string.Empty;
     public long FromDeltaSeq { get; init; }
@@ -551,6 +692,11 @@ internal sealed class DeltaPackage
     public Dictionary<string, long> SourceMaxIds { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, List<SerializedDeltaRow>> Tables { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public List<AffectedPair> AffectedPairs { get; init; } = [];
+    public string? OperationsFile { get; set; }
+    public string? OperationsSha256 { get; set; }
+    public long OperationsRowCount { get; set; }
+    [JsonIgnore]
+    public string PackageDirectory { get; set; } = string.Empty;
 }
 
 internal sealed class SerializedDeltaRow

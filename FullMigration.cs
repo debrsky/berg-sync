@@ -376,8 +376,6 @@ internal static class FullMigration
                 }
 
                 copied++;
-                if (copied % 10_000 == 0)
-                    Console.Write($"\r  {tableName,-20} {copied,12:N0}");
             }
 
             await importer.CompleteAsync();
@@ -394,7 +392,7 @@ internal static class FullMigration
 
         await transaction.CommitAsync();
         timer.Stop();
-        Console.WriteLine($"\r  {tableName,-20} {copied,12:N0} строк  {timer.Elapsed}");
+        Console.WriteLine($"  {tableName,-20} {copied,12:N0} строк  {timer.Elapsed}");
         Console.WriteLine($"[PROFILE] COPY MDB → PostgreSQL: {tableName}: " +
                           $"{timer.Elapsed.TotalMilliseconds:N0} мс; строк: {copied:N0}");
         return copied;

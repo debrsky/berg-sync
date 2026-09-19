@@ -4,9 +4,9 @@ COMMIT;
 
 BEGIN;
 CREATE TABLE bergapp.operations (
-    op_seq_num integer,
-    id_seller integer,
-    id_payer integer,
+    op_seq_num integer NOT NULL,
+    id_seller integer NOT NULL,
+    id_payer integer NOT NULL,
     op_date date,
     op_date_ts timestamp without time zone,
     op_type integer,
@@ -28,11 +28,12 @@ CREATE TABLE bergapp.operations (
     inv_debt_after numeric,
     
     debt_invoices_before jsonb,
-    debt_invoices_after jsonb
+    debt_invoices_after jsonb,
+
+    CONSTRAINT operations_pkey PRIMARY KEY (id_seller, id_payer, op_seq_num)
 );
 
--- Ускоряет удаление и повторную запись отдельных финансовых пар при delta-синхронизации.
-CREATE INDEX operations_payer_seller_idx ON bergapp.operations (id_payer, id_seller);
+-- Первичный ключ одновременно ускоряет замену операций отдельных финансовых пар.
 
 -- Дополнительные индексы пока не создаём без подтверждённой нагрузки чтения.
 -- CREATE INDEX operations_seller_payer_seq_idx ON bergapp.operations (id_seller, id_payer, op_seq_num DESC);

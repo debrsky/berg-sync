@@ -153,14 +153,6 @@ internal static class IncrementalSync
             pair => new DeltaTableCount(pair.Value.Inserted, pair.Value.Updated),
             StringComparer.OrdinalIgnoreCase);
         string? packagePath = null;
-        if (syncHosting)
-        {
-            packagePath = await RemoteDeltaDelivery.WritePackageAsync(
-                packageRoot, patchId, state.BaselineId, state.DeltaSeq, nextSeq,
-                sourcePath, periodStart, dateOffsetHours, changedRows,
-                affectedPairList, packageCounts, sourceMax, schema);
-            Console.WriteLine($"Пакет дельты: {packagePath}");
-        }
 
         foreach (var table in DataTables)
         {
@@ -173,12 +165,6 @@ internal static class IncrementalSync
 
         if (recalculate && affectedPairs > 0)
         {
-            // Старые базы могли быть созданы до появления индекса в migration SQL.
-            await ExecuteAsync(postgres, """
-                CREATE INDEX IF NOT EXISTS operations_payer_seller_idx
-                ON bergapp.operations (id_payer, id_seller)
-                """, transaction);
-
             Console.WriteLine($"Пересчёт финансовых пар: {affectedPairs:N0}");
             phaseTimer.Restart();
             if (affectedPairs <= 500)
@@ -200,6 +186,16 @@ internal static class IncrementalSync
             }
             LogProfile("Локальный пересчёт operations", phaseTimer,
                 $"пар: {affectedPairs:N0}");
+        }
+
+        if (syncHosting)
+        {
+            packagePath = await RemoteDeltaDelivery.WritePackageAsync(
+                packageRoot, patchId, state.BaselineId, state.DeltaSeq, nextSeq,
+                sourcePath, periodStart, dateOffsetHours, changedRows,
+                affectedPairList, packageCounts, sourceMax, schema,
+                postgres, transaction, recalculate && affectedPairs > 0);
+            Console.WriteLine($"Пакет дельты: {packagePath}");
         }
 
         if (refreshViews && totalChanges > 0)
@@ -649,6 +645,15 @@ internal static class IncrementalSync
             if (schema.Tables[table].All(column => !column.PK))
                 throw new InvalidOperationException($"У таблицы {table} не задан первичный ключ.");
         }
+
+        await using (var command = postgres.CreateCommand())
+        {
+            command.CommandText = "SELECT to_regclass('bergapp.operations') IS NOT NULL";
+            if (!Convert.ToBoolean(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture))
+                throw new InvalidOperationException(
+                    "Нет целевой таблицы bergapp.operations. Сначала выполните полную миграцию.");
+        }
+        await RemoteDeltaDelivery.EnsureOperationsPrimaryKeyAsync(postgres);
     }
 
     private static Dictionary<string, long> ReadSourceMaxIds(OleDbConnection access)
