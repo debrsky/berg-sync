@@ -11,6 +11,16 @@ log() {
     printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
+now_ms() {
+    date '+%s%3N'
+}
+
+profile() {
+    local operation="$1"
+    local started_ms="$2"
+    log "[PROFILE] $operation: $(( $(now_ms) - started_ms )) ms"
+}
+
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
@@ -95,6 +105,7 @@ exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     die "Another restore process is already running"
 fi
+TOTAL_STARTED_MS="$(now_ms)"
 
 cleanup() {
     rm -rf -- "$WORK_DIR"
@@ -117,17 +128,22 @@ expected_name="${expected_name%$'\r'}"
 [[ -z "${extra:-}" ]] || die "Unexpected data in checksum file: $CHECKSUM_FILE"
 
 log "Calculating SHA-256 for $ARCHIVE_NAME"
+PHASE_STARTED_MS="$(now_ms)"
 actual_hash="$(sha256sum -- "$ARCHIVE" | awk '{print $1}')"
 [[ "$actual_hash" == "$expected_hash" ]] || \
     die "SHA-256 mismatch for $ARCHIVE_NAME"
+profile "SHA-256 verification" "$PHASE_STARTED_MS"
 
 log "Verifying Zstandard archive"
+PHASE_STARTED_MS="$(now_ms)"
 zstd --quiet --test -- "$ARCHIVE" || die "Zstandard archive is damaged"
+profile "Zstandard verification" "$PHASE_STARTED_MS"
 
 rm -rf -- "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
 log "Checking archive contents"
+PHASE_STARTED_MS="$(now_ms)"
 if ! zstd --quiet --decompress --stdout -- "$ARCHIVE" | tar -tf - > "$FILE_LIST"; then
     die "Cannot list archive contents"
 fi
@@ -138,11 +154,14 @@ while IFS= read -r entry; do
         *) die "Unexpected path in archive: $entry" ;;
     esac
 done < "$FILE_LIST"
+profile "Archive content validation" "$PHASE_STARTED_MS"
 
 log "Extracting archive"
+PHASE_STARTED_MS="$(now_ms)"
 if ! zstd --quiet --decompress --stdout -- "$ARCHIVE" | tar -xf - -C "$WORK_DIR"; then
     die "Cannot extract archive"
 fi
+profile "Archive extraction" "$PHASE_STARTED_MS"
 
 [[ -f "$DUMP_DIR/toc.dat" ]] || \
     die "Directory-format PostgreSQL dump is missing: $DUMP_DIR/toc.dat"
@@ -155,6 +174,7 @@ grep -q 'bergapp' "$TOC_LIST" || die "bergapp is absent from the dump"
 grep -q 'berg_sync' "$TOC_LIST" || die "berg_sync is absent from the dump"
 
 log "Checking PostgreSQL target"
+PHASE_STARTED_MS="$(now_ms)"
 target_info="$(
     "$PSQL_BIN" -X -qAt -v ON_ERROR_STOP=1 -F '|' -c \
         "SELECT current_database(), current_user, pg_is_in_recovery();"
@@ -166,12 +186,26 @@ IFS='|' read -r actual_database actual_user in_recovery <<< "$target_info"
 [[ "$actual_user" == "$PGUSER" ]] || \
     die "Connected as unexpected user: $actual_user"
 [[ "$in_recovery" == "f" ]] || die "Target PostgreSQL is in recovery mode"
+profile "PostgreSQL target validation" "$PHASE_STARTED_MS"
 
 log "Ensuring required PostgreSQL extensions"
+PHASE_STARTED_MS="$(now_ms)"
 "$PSQL_BIN" -X -q -v ON_ERROR_STOP=1 -c \
     "CREATE EXTENSION IF NOT EXISTS hstore;"
 
+# These functions existed in older deployments but are no longer part of the
+# dump. pg_restore --clean only removes objects listed in the new dump, so the
+# legacy functions would otherwise prevent removal of the bergapp schema.
+log "Removing legacy XML functions"
+"$PSQL_BIN" -X -q -v ON_ERROR_STOP=1 -c "
+    DROP FUNCTION IF EXISTS bergapp.get_balances_xml(date);
+    DROP FUNCTION IF EXISTS bergapp.get_payers_xml();
+    DROP FUNCTION IF EXISTS bergapp.get_sellers_xml();
+"
+profile "Extension and legacy object preparation" "$PHASE_STARTED_MS"
+
 log "Restoring into $PGHOST:$PGPORT/$PGDATABASE as $PGUSER"
+PHASE_STARTED_MS="$(now_ms)"
 "$PG_RESTORE_BIN" \
     --clean \
     --if-exists \
@@ -182,8 +216,10 @@ log "Restoring into $PGHOST:$PGPORT/$PGDATABASE as $PGUSER"
     --verbose \
     --dbname="$PGDATABASE" \
     "$DUMP_DIR"
+profile "pg_restore" "$PHASE_STARTED_MS"
 
 log "Running post-restore checks"
+PHASE_STARTED_MS="$(now_ms)"
 post_restore="$(
     "$PSQL_BIN" -X -qAt -v ON_ERROR_STOP=1 -F '|' -c "
         SELECT
@@ -214,6 +250,7 @@ done
 
 [[ -n "$baseline_id" ]] || die "berg_sync.state does not contain baseline_id"
 [[ "$delta_seq" == "0" ]] || die "Full restore must set delta_seq to 0"
+profile "Post-restore checks" "$PHASE_STARTED_MS"
 
 {
     printf 'restored_at=%s\n' "$(date --iso-8601=seconds)"
@@ -232,3 +269,4 @@ rm -f -- "$ARCHIVE" "$CHECKSUM_FILE"
 
 log "Restore completed successfully"
 log "Baseline: $baseline_id; Applications: $applications_count; XInvoices: $invoices_count; Operations: $operations_count"
+profile "Remote restore — total" "$TOTAL_STARTED_MS"

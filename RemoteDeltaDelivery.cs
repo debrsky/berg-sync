@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -33,6 +34,8 @@ internal static class RemoteDeltaDelivery
         IReadOnlyDictionary<string, long> sourceMaxIds,
         MigrationSchema schema)
     {
+        var totalTimer = Stopwatch.StartNew();
+        var phaseTimer = Stopwatch.StartNew();
         var package = new DeltaPackage
         {
             PatchId = patchId,
@@ -57,17 +60,26 @@ internal static class RemoteDeltaDelivery
                 : [];
         }
 
+        LogProfile(patchId, "Сериализация строк пакета", phaseTimer,
+            $"строк: {package.Tables.Values.Sum(table => table.Count):N0}; пар: {affectedPairs.Count:N0}");
+
         var directory = Path.Combine(root, patchId);
         Directory.CreateDirectory(directory);
         var packagePath = Path.Combine(directory, "package.json");
         var temporaryPath = packagePath + ".tmp";
+        phaseTimer.Restart();
         var json = JsonSerializer.Serialize(package, new JsonSerializerOptions { WriteIndented = false });
         await File.WriteAllTextAsync(temporaryPath, json, new UTF8Encoding(false));
         File.Move(temporaryPath, packagePath, overwrite: true);
+        LogProfile(patchId, "Запись package.json", phaseTimer,
+            $"размер: {new FileInfo(packagePath).Length:N0} байт");
 
+        phaseTimer.Restart();
         var checksum = await CalculateSha256Async(packagePath);
         await File.WriteAllTextAsync(
             Path.Combine(directory, "package.sha256"), checksum + "\n", new UTF8Encoding(false));
+        LogProfile(patchId, "Расчёт и запись SHA-256", phaseTimer);
+        LogProfile(patchId, "Формирование пакета — всего", totalTimer);
         return directory;
     }
 
@@ -79,6 +91,7 @@ internal static class RemoteDeltaDelivery
         bool recalculate,
         bool refreshViews)
     {
+        var timer = Stopwatch.StartNew();
         var pending = new List<string>();
         try
         {
@@ -94,9 +107,11 @@ internal static class RemoteDeltaDelivery
         }
         catch (PostgresException exception) when (exception.SqlState is "42P01" or "3F000")
         {
+            LogProfile("pending", "Чтение очереди доставки", timer, "таблица состояния отсутствует");
             return;
         }
 
+        LogProfile("pending", "Чтение очереди доставки", timer, $"пакетов: {pending.Count:N0}");
         foreach (var patchId in pending)
         {
             Console.WriteLine($"Повторная доставка pending-пакета: {patchId}");
@@ -114,21 +129,39 @@ internal static class RemoteDeltaDelivery
         bool recalculate,
         bool refreshViews)
     {
+        var totalTimer = Stopwatch.StartNew();
+        var phaseTimer = Stopwatch.StartNew();
         try
         {
+            Console.WriteLine($"[PROFILE] [{package.PatchId}] Начало публикации на хостинг; " +
+                              $"строк: {package.Tables.Values.Sum(table => table.Count):N0}; " +
+                              $"пар: {package.AffectedPairs.Count:N0}");
             await MarkDeliveryAttemptAsync(local, package.PatchId, "applying", null);
+            LogProfile(package.PatchId, "Локальная отметка applying", phaseTimer);
+
             await ApplyAsync(hostingConnectionString, package, schema, recalculate, refreshViews);
+
+            phaseTimer.Restart();
             await MarkDeliveryAttemptAsync(local, package.PatchId, "applied", null, applied: true);
+            LogProfile(package.PatchId, "Локальная отметка applied", phaseTimer);
+            LogProfile(package.PatchId, "Публикация на хостинг — всего", totalTimer);
         }
         catch (Exception exception)
         {
+            phaseTimer.Restart();
             await MarkDeliveryAttemptAsync(local, package.PatchId, "failed", exception.Message);
+            LogProfile(package.PatchId, "Локальная отметка failed", phaseTimer);
+            totalTimer.Stop();
+            Console.WriteLine($"[PROFILE] [{package.PatchId}] Публикация завершилась ошибкой через " +
+                              $"{totalTimer.Elapsed.TotalMilliseconds:N0} мс: {exception.Message}");
             throw;
         }
     }
 
     public static async Task<DeltaPackage> LoadPackageAsync(string root, string patchId)
     {
+        var totalTimer = Stopwatch.StartNew();
+        var phaseTimer = Stopwatch.StartNew();
         var directory = Path.Combine(root, patchId);
         var packagePath = Path.Combine(directory, "package.json");
         var checksumPath = Path.Combine(directory, "package.sha256");
@@ -139,9 +172,16 @@ internal static class RemoteDeltaDelivery
         var actual = await CalculateSha256Async(packagePath);
         if (!string.Equals(expected, actual, StringComparison.Ordinal))
             throw new InvalidOperationException($"Не совпадает SHA-256 пакета {patchId}.");
+        LogProfile(patchId, "Проверка SHA-256 пакета", phaseTimer,
+            $"размер: {new FileInfo(packagePath).Length:N0} байт");
 
-        return JsonSerializer.Deserialize<DeltaPackage>(await File.ReadAllTextAsync(packagePath))
-               ?? throw new InvalidOperationException($"Не удалось прочитать пакет {patchId}.");
+        phaseTimer.Restart();
+        var package = JsonSerializer.Deserialize<DeltaPackage>(await File.ReadAllTextAsync(packagePath))
+                      ?? throw new InvalidOperationException($"Не удалось прочитать пакет {patchId}.");
+        LogProfile(patchId, "Чтение и десериализация пакета", phaseTimer,
+            $"строк: {package.Tables.Values.Sum(table => table.Count):N0}");
+        LogProfile(patchId, "Загрузка пакета — всего", totalTimer);
+        return package;
     }
 
     private static async Task ApplyAsync(
@@ -151,12 +191,24 @@ internal static class RemoteDeltaDelivery
         bool recalculate,
         bool refreshViews)
     {
+        var phaseTimer = Stopwatch.StartNew();
         await using var hosting = new NpgsqlConnection(connectionString);
         await hosting.OpenAsync();
+        LogProfile(package.PatchId, "Подключение к PostgreSQL хостинга", phaseTimer,
+            $"сервер: {hosting.Host}/{hosting.Database}");
 
+        phaseTimer.Restart();
         var current = await ReadRemoteStateAsync(hosting);
-        if (current.BaselineId == package.BaselineId && current.DeltaSeq == package.ToDeltaSeq &&
-            await PatchExistsAsync(hosting, package.PatchId))
+        LogProfile(package.PatchId, "Чтение состояния хостинга", phaseTimer,
+            $"состояние: {current.BaselineId}/{current.DeltaSeq}");
+
+        phaseTimer.Restart();
+        var alreadyApplied = current.BaselineId == package.BaselineId &&
+                             current.DeltaSeq == package.ToDeltaSeq &&
+                             await PatchExistsAsync(hosting, package.PatchId);
+        LogProfile(package.PatchId, "Проверка идемпотентности", phaseTimer,
+            $"уже применён: {(alreadyApplied ? "да" : "нет")}");
+        if (alreadyApplied)
         {
             Console.WriteLine($"Пакет {package.PatchId} уже применён на хостинге.");
             return;
@@ -167,23 +219,31 @@ internal static class RemoteDeltaDelivery
                 $"ожидалось {package.BaselineId}/{package.FromDeltaSeq}, " +
                 $"получено {current.BaselineId}/{current.DeltaSeq}.");
 
+        phaseTimer.Restart();
         await using var transaction = await hosting.BeginTransactionAsync();
         await ExecuteAsync(hosting, transaction, "SELECT pg_advisory_xact_lock(1896472001)");
+        LogProfile(package.PatchId, "Открытие транзакции и ожидание advisory lock", phaseTimer);
 
         // Повторяем проверку после получения блокировки.
+        phaseTimer.Restart();
         current = await ReadRemoteStateAsync(hosting, transaction);
+        LogProfile(package.PatchId, "Повторная проверка состояния под блокировкой", phaseTimer);
         if (current.BaselineId != package.BaselineId || current.DeltaSeq != package.FromDeltaSeq)
             throw new InvalidOperationException("Состояние хостинга изменилось во время ожидания блокировки.");
 
         foreach (var table in Tables)
         {
+            phaseTimer.Restart();
             await ExecuteAsync(hosting, transaction,
                 $"CREATE TEMP TABLE {Stage(table)} (LIKE bergauto.{Quote(table)} INCLUDING DEFAULTS) ON COMMIT DROP");
             var rows = package.Tables.GetValueOrDefault(table) ?? [];
             await CopyRowsAsync(
                 hosting, table, schema.Tables[table], rows, package.DateOffsetHours);
+            LogProfile(package.PatchId, $"Создание staging и COPY: {table}", phaseTimer,
+                $"строк: {rows.Count:N0}");
         }
 
+        phaseTimer.Restart();
         await ExecuteAsync(hosting, transaction, """
             CREATE TEMP TABLE delta_affected_pairs (
               id_payer integer NOT NULL,
@@ -202,12 +262,21 @@ internal static class RemoteDeltaDelivery
             }
             await importer.CompleteAsync();
         }
+        LogProfile(package.PatchId, "COPY затронутых финансовых пар", phaseTimer,
+            $"пар: {package.AffectedPairs.Distinct().Count():N0}");
 
         foreach (var table in Tables)
+        {
+            phaseTimer.Restart();
             await UpsertAsync(hosting, transaction, table, schema.Tables[table]);
+            var count = package.Counts.GetValueOrDefault(table);
+            LogProfile(package.PatchId, $"UPSERT на хостинге: {table}", phaseTimer,
+                $"изменений: {count?.Inserted + count?.Updated ?? 0:N0}");
+        }
 
         if (recalculate && package.AffectedPairs.Count > 0)
         {
+            phaseTimer.Restart();
             await ExecuteAsync(hosting, transaction, """
                 CREATE INDEX IF NOT EXISTS operations_payer_seller_idx
                 ON bergapp.operations (id_payer,id_seller)
@@ -224,12 +293,20 @@ internal static class RemoteDeltaDelivery
                     """);
             else
                 await ExecuteAsync(hosting, transaction, "CALL bergapp.calculate_and_save_operations()");
+            LogProfile(package.PatchId, "Пересчёт operations на хостинге", phaseTimer,
+                $"пар: {package.AffectedPairs.Count:N0}");
         }
 
         var totalChanges = package.Counts.Values.Sum(value => value.Inserted + value.Updated);
         if (refreshViews && totalChanges > 0)
             foreach (var view in new[] { "payers", "sellers", "invoices", "counterparties", "balances", "debt_invoices" })
+            {
+                phaseTimer.Restart();
                 await ExecuteAsync(hosting, transaction, $"REFRESH MATERIALIZED VIEW bergapp.{Quote(view)}");
+                LogProfile(package.PatchId, $"REFRESH на хостинге: {view}", phaseTimer);
+            }
+
+        phaseTimer.Restart();
 
         await using (var command = hosting.CreateCommand())
         {
@@ -277,8 +354,12 @@ internal static class RemoteDeltaDelivery
             await command.ExecuteNonQueryAsync();
         }
 
+        LogProfile(package.PatchId, "Запись метаданных патча на хостинге", phaseTimer);
+        phaseTimer.Restart();
         await transaction.CommitAsync();
+        LogProfile(package.PatchId, "COMMIT на хостинге", phaseTimer);
 
+        phaseTimer.Restart();
         var appliedState = await ReadRemoteStateAsync(hosting);
         if (appliedState.BaselineId != package.BaselineId ||
             appliedState.DeltaSeq != package.ToDeltaSeq ||
@@ -286,6 +367,8 @@ internal static class RemoteDeltaDelivery
             throw new InvalidOperationException(
                 $"Проверка применённого пакета {package.PatchId} на хостинге не пройдена.");
 
+        LogProfile(package.PatchId, "Проверка результата публикации", phaseTimer,
+            $"состояние: {appliedState.BaselineId}/{appliedState.DeltaSeq}");
         Console.WriteLine($"Пакет {package.PatchId} применён на хостинге.");
     }
 
@@ -435,6 +518,14 @@ internal static class RemoteDeltaDelivery
         await using var stream = File.OpenRead(path);
         var hash = await SHA256.HashDataAsync(stream);
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static void LogProfile(
+        string patchId, string operation, Stopwatch stopwatch, string? details = null)
+    {
+        stopwatch.Stop();
+        Console.WriteLine($"[PROFILE] [{patchId}] {operation}: {stopwatch.Elapsed.TotalMilliseconds:N0} мс" +
+                          (string.IsNullOrWhiteSpace(details) ? string.Empty : $"; {details}"));
     }
 
     private static string? Truncate(string? value, int length) =>

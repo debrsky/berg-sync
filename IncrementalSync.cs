@@ -45,7 +45,10 @@ internal static class IncrementalSync
         Console.WriteLine($"  Customers: {(fullCustomers ? "полный проход" : "новые и связанные")}");
         Console.WriteLine("  удаления: не применяются");
 
+        var phaseTimer = Stopwatch.StartNew();
         await EnsureTargetAsync(postgres, schema);
+        LogProfile("Подготовка локальной базы", phaseTimer);
+
         var packageRoot = RemoteDeltaDelivery.ResolvePackageRoot(packageDirectory);
         string? hostingConnectionString = null;
         if (syncHosting)
@@ -53,39 +56,61 @@ internal static class IncrementalSync
             hostingConnectionString = Environment.GetEnvironmentVariable("PG_HOSTING_CONNECTION_STRING");
             if (string.IsNullOrWhiteSpace(hostingConnectionString))
                 throw new ArgumentException("Для --sync-hosting задайте PG_HOSTING_CONNECTION_STRING.");
+            phaseTimer.Restart();
             await RemoteDeltaDelivery.DeliverPendingAsync(
                 postgres, hostingConnectionString, packageRoot, schema, recalculate, refreshViews);
+            LogProfile("Проверка и доставка отложенных пакетов", phaseTimer);
         }
 
+        phaseTimer.Restart();
         var targetMax = await ReadTargetMaxIdsAsync(postgres);
         var sourceMax = ReadSourceMaxIds(access);
         ValidateFreshness(sourceMax, targetMax);
+        LogProfile("Чтение и проверка максимальных ID", phaseTimer);
 
         var periodStart = DateTime.Today.AddDays(-periodDays);
+        phaseTimer.Restart();
         var candidates = ReadCandidates(
             access, schema, targetMax, periodStart, idOverlap,
             paymentIdOverlap, invoiceDataIdOverlap, fullCustomers);
+        LogProfile("Чтение кандидатов из MDB", phaseTimer,
+            $"строк: {candidates.Values.Sum(rows => rows.Count):N0}");
 
         Console.WriteLine("\nКандидаты:");
         foreach (var table in DataTables)
             Console.WriteLine($"  {table,-20} {candidates[table].Count,10:N0}");
 
+        phaseTimer.Restart();
         await using var transaction = await postgres.BeginTransactionAsync();
         await ExecuteAsync(postgres, "SELECT pg_advisory_xact_lock(1896472001)", transaction);
         var state = await EnsureStateAsync(
             postgres, transaction, sourcePath, dateOffsetHours, targetMax);
+        LogProfile("Открытие локальной транзакции и получение блокировки", phaseTimer);
 
         if (Math.Abs(state.DateOffsetHours - dateOffsetHours) > 0.000001)
             throw new InvalidOperationException(
                 $"Коррекция дат не совпадает с baseline: в состоянии {state.DateOffsetHours}, задано {dateOffsetHours}.");
 
+        phaseTimer.Restart();
         await CreateStagingTablesAsync(postgres, transaction, schema);
+        LogProfile("Создание локальных staging-таблиц", phaseTimer);
         foreach (var table in DataTables)
+        {
+            phaseTimer.Restart();
             await CopyRowsAsync(postgres, transaction, table, schema.Tables[table], candidates[table].Values, dateOffsetHours);
+            LogProfile($"COPY в локальный staging: {table}", phaseTimer,
+                $"строк: {candidates[table].Count:N0}");
+        }
 
+        phaseTimer.Restart();
         var changes = await ReadChangesAsync(postgres, transaction, schema);
+        LogProfile("Сравнение staging с локальными таблицами", phaseTimer);
+
+        phaseTimer.Restart();
         var unstable = await RemoveUnstableRowsAsync(
             access, postgres, transaction, schema, candidates, changes);
+        LogProfile("Повторная проверка изменившихся строк MDB", phaseTimer,
+            $"отложено нестабильных строк: {unstable:N0}");
         if (unstable > 0)
         {
             Console.WriteLine($"Нестабильных строк отложено: {unstable:N0}");
@@ -104,16 +129,22 @@ internal static class IncrementalSync
             Console.WriteLine($"  {table,-20} +{value.Inserted,7:N0}  ~{value.Updated,7:N0}");
         }
 
+        phaseTimer.Restart();
         await BuildAffectedPairsAsync(postgres, transaction);
         var affectedPairList = await ReadAffectedPairsAsync(postgres, transaction);
         var affectedPairs = affectedPairList.Count;
+        LogProfile("Определение затронутых финансовых пар", phaseTimer,
+            $"пар: {affectedPairs:N0}");
 
+        phaseTimer.Restart();
         var changedRows = new Dictionary<string, IReadOnlyList<object?[]>>(StringComparer.OrdinalIgnoreCase);
         foreach (var table in DataTables)
         {
             var changedIds = await ReadChangedIdsAsync(postgres, transaction, table, schema.Tables[table]);
             changedRows[table] = changedIds.Select(id => candidates[table][id].Values).ToArray();
         }
+        LogProfile("Формирование набора строк дельты", phaseTimer,
+            $"строк: {changedRows.Values.Sum(rows => rows.Count):N0}");
 
         var nextSeq = state.DeltaSeq + 1;
         var patchId = $"{state.BaselineId}-delta-{nextSeq:0000}";
@@ -132,7 +163,13 @@ internal static class IncrementalSync
         }
 
         foreach (var table in DataTables)
+        {
+            phaseTimer.Restart();
             await UpsertAsync(postgres, transaction, table, schema.Tables[table]);
+            var tableChanges = changes[table];
+            LogProfile($"Локальный UPSERT: {table}", phaseTimer,
+                $"изменений: {tableChanges.Inserted + tableChanges.Updated:N0}");
+        }
 
         if (recalculate && affectedPairs > 0)
         {
@@ -143,6 +180,7 @@ internal static class IncrementalSync
                 """, transaction);
 
             Console.WriteLine($"Пересчёт финансовых пар: {affectedPairs:N0}");
+            phaseTimer.Restart();
             if (affectedPairs <= 500)
             {
                 await ExecuteAsync(postgres, """
@@ -160,18 +198,25 @@ internal static class IncrementalSync
                 Console.WriteLine("Затронуто более 500 пар — полный пересчёт operations.");
                 await ExecuteAsync(postgres, "CALL bergapp.calculate_and_save_operations()", transaction);
             }
+            LogProfile("Локальный пересчёт operations", phaseTimer,
+                $"пар: {affectedPairs:N0}");
         }
 
         if (refreshViews && totalChanges > 0)
         {
             Console.WriteLine("Обновление materialized views...");
             foreach (var view in new[] { "payers", "sellers", "invoices", "counterparties", "balances", "debt_invoices" })
+            {
+                phaseTimer.Restart();
                 await ExecuteAsync(postgres, $"REFRESH MATERIALIZED VIEW bergapp.{Quote(view)}", transaction);
+                LogProfile($"Локальный REFRESH: {view}", phaseTimer);
+            }
         }
 
         var countsJson = JsonSerializer.Serialize(packageCounts);
         var maxJson = JsonSerializer.Serialize(sourceMax);
 
+        phaseTimer.Restart();
         await using (var command = postgres.CreateCommand())
         {
             command.Transaction = transaction;
@@ -219,7 +264,10 @@ internal static class IncrementalSync
             await command.ExecuteNonQueryAsync();
         }
 
+        LogProfile("Запись метаданных локального патча", phaseTimer);
+        phaseTimer.Restart();
         await transaction.CommitAsync();
+        LogProfile("COMMIT локального патча", phaseTimer);
 
         if (syncHosting)
         {
@@ -234,6 +282,13 @@ internal static class IncrementalSync
         Console.WriteLine(syncHosting
             ? "Тот же пакет применён на хостинге."
             : "На хостинг данные не отправлялись.");
+    }
+
+    private static void LogProfile(string operation, Stopwatch stopwatch, string? details = null)
+    {
+        stopwatch.Stop();
+        Console.WriteLine($"[PROFILE] {operation}: {stopwatch.Elapsed.TotalMilliseconds:N0} мс" +
+                          (string.IsNullOrWhiteSpace(details) ? string.Empty : $"; {details}"));
     }
 
     private static Dictionary<string, Dictionary<int, SourceRow>> ReadCandidates(

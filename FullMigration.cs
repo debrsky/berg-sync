@@ -40,8 +40,10 @@ internal static class FullMigration
                 "Полная миграция удаляет схемы bergauto и bergapp. Добавьте --confirm-drop.");
 
         var totalTimer = Stopwatch.StartNew();
+        var phaseTimer = Stopwatch.StartNew();
         var schema = LoadSchema();
         var sqlRoot = ResolveSqlDirectory(sqlDirectory);
+        LogProfile("Загрузка конфигурации миграции", phaseTimer);
 
         Console.WriteLine("\nПОЛНАЯ МИГРАЦИЯ MDB → PostgreSQL");
         Console.WriteLine($"  база: {databaseName}");
@@ -55,17 +57,22 @@ internal static class FullMigration
             Database = adminDatabase
         };
 
+        phaseTimer.Restart();
         await EnsureDatabaseAsync(adminBuilder.ConnectionString, databaseName);
+        LogProfile("Проверка и подготовка целевой базы", phaseTimer);
 
         var targetBuilder = new NpgsqlConnectionStringBuilder(baseConnectionString)
         {
             Database = databaseName
         };
 
+        phaseTimer.Restart();
         await using var postgres = new NpgsqlConnection(targetBuilder.ConnectionString);
         await postgres.OpenAsync();
         Console.WriteLine($"Подключено: {postgres.Host}/{postgres.Database}");
+        LogProfile("Подключение к локальному PostgreSQL", phaseTimer);
 
+        phaseTimer.Restart();
         await ExecuteAsync(postgres, "CREATE EXTENSION IF NOT EXISTS hstore");
         // Полная миграция создаёт новый baseline; старые номера локальных дельт недействительны.
         await ExecuteAsync(postgres, "DROP SCHEMA IF EXISTS berg_sync CASCADE");
@@ -74,8 +81,12 @@ internal static class FullMigration
         await ExecuteAsync(postgres, "DROP SCHEMA IF EXISTS bergapp CASCADE");
         await ExecuteAsync(postgres, "CREATE SCHEMA bergapp");
         Console.WriteLine("Схемы bergauto и bergapp пересозданы.");
+        LogProfile("Пересоздание схем и установка hstore", phaseTimer);
 
+        phaseTimer.Restart();
         await CreateRawTablesAsync(postgres, schema);
+        LogProfile("Создание таблиц bergauto", phaseTimer,
+            $"таблиц: {schema.TablesOrder.Count:N0}");
 
         long totalRows = 0;
         foreach (var tableName in schema.TablesOrder)
@@ -88,6 +99,7 @@ internal static class FullMigration
         }
 
         Console.WriteLine("\nСоздание индексов...");
+        phaseTimer.Restart();
         await ExecuteAsync(postgres, "SET search_path TO bergauto");
         var indexCount = 0;
         foreach (var tableName in schema.TablesOrder)
@@ -95,47 +107,78 @@ internal static class FullMigration
             if (!schema.Indexes.TryGetValue(tableName, out var indexes))
                 continue;
 
+            var tableTimer = Stopwatch.StartNew();
             foreach (var indexSql in indexes)
             {
                 await ExecuteAsync(postgres, indexSql);
                 indexCount++;
             }
+            LogProfile($"Индексы: {tableName}", tableTimer,
+                $"индексов: {indexes.Count:N0}");
         }
         Console.WriteLine($"Индексов создано: {indexCount}");
+        LogProfile("Создание индексов — всего", phaseTimer,
+            $"индексов: {indexCount:N0}");
 
         Console.WriteLine("ANALYZE...");
+        phaseTimer.Restart();
         foreach (var tableName in schema.TablesOrder)
+        {
+            var tableTimer = Stopwatch.StartNew();
             await ExecuteAsync(postgres, $"ANALYZE bergauto.{QuoteIdentifier(tableName)}");
+            LogProfile($"ANALYZE: {tableName}", tableTimer);
+        }
+        LogProfile("ANALYZE — всего", phaseTimer);
 
         // hstore установлен в public; возвращаем стандартный search_path после
         // создания индексов, которые используют короткие имена таблиц bergauto.
         await ExecuteAsync(postgres, "RESET search_path");
 
         Console.WriteLine("\nСоздание расчётных функций и таблицы операций...");
+        phaseTimer.Restart();
         await ExecuteBundledScriptAsync(postgres, "sql/get-operations.sql");
         foreach (var script in OperationScripts)
             await ExecuteScriptAsync(postgres, sqlRoot, script);
+        LogProfile("Установка расчётных SQL-объектов", phaseTimer);
 
         Console.WriteLine("Расчёт операций...");
+        phaseTimer.Restart();
         await ExecuteAsync(postgres, "CALL bergapp.calculate_and_save_operations()");
         var operationCount = await ExecuteScalarInt64Async(
             postgres, "SELECT COUNT(*) FROM bergapp.operations");
         Console.WriteLine($"Операций: {operationCount:N0}");
+        LogProfile("Полный расчёт operations", phaseTimer,
+            $"операций: {operationCount:N0}");
 
         Console.WriteLine("\nСоздание materialized views...");
         foreach (var script in ViewScripts)
+        {
+            phaseTimer.Restart();
             await ExecuteScriptAsync(postgres, sqlRoot, script);
+            LogProfile($"Создание materialized view: {Path.GetFileNameWithoutExtension(script)}", phaseTimer);
+        }
 
+        phaseTimer.Restart();
         await InitializeSyncStateAsync(
             postgres, schema, baselineId, sourcePath, dateOffsetHours);
+        LogProfile("Создание состояния синхронизации", phaseTimer,
+            $"baseline: {baselineId}");
 
         totalTimer.Stop();
+        Console.WriteLine($"[PROFILE] Полная миграция — всего: {totalTimer.Elapsed.TotalMilliseconds:N0} мс");
         Console.WriteLine("\n============================================================");
         Console.WriteLine("МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО");
         Console.WriteLine($"Перенесено строк: {totalRows:N0}");
         Console.WriteLine($"Операций: {operationCount:N0}");
         Console.WriteLine($"Время: {totalTimer.Elapsed}");
         Console.WriteLine("============================================================");
+    }
+
+    private static void LogProfile(string operation, Stopwatch stopwatch, string? details = null)
+    {
+        stopwatch.Stop();
+        Console.WriteLine($"[PROFILE] {operation}: {stopwatch.Elapsed.TotalMilliseconds:N0} мс" +
+                          (string.IsNullOrWhiteSpace(details) ? string.Empty : $"; {details}"));
     }
 
     private static async Task InitializeSyncStateAsync(
@@ -352,6 +395,8 @@ internal static class FullMigration
         await transaction.CommitAsync();
         timer.Stop();
         Console.WriteLine($"\r  {tableName,-20} {copied,12:N0} строк  {timer.Elapsed}");
+        Console.WriteLine($"[PROFILE] COPY MDB → PostgreSQL: {tableName}: " +
+                          $"{timer.Elapsed.TotalMilliseconds:N0} мс; строк: {copied:N0}");
         return copied;
     }
 

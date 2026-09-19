@@ -24,6 +24,8 @@ internal static class HostingPublisher
                 "Публикация заменяет bergauto, bergapp и berg_sync на хостинге. " +
                 "Добавьте --confirm-hosting-restore.");
 
+        var totalTimer = Stopwatch.StartNew();
+        var phaseTimer = Stopwatch.StartNew();
         var hostingConnectionString = RequireEnvironment("PG_HOSTING_CONNECTION_STRING");
         var sshTarget = RequireEnvironment("HOSTING_SSH_TARGET");
         var remoteDirectory = NormalizeRemotePath(RequireEnvironment("HOSTING_TRANSFER_DIR"));
@@ -44,13 +46,21 @@ internal static class HostingPublisher
         await using var local = new NpgsqlConnection(localBuilder.ConnectionString);
         await local.OpenAsync();
         var state = await ReadStateAsync(local);
+        LogProfile("full", "Подключение и чтение состояния локальной базы", phaseTimer,
+            $"baseline: {state.BaselineId}; delta_seq: {state.DeltaSeq}");
         if (state.DeltaSeq != 0)
             throw new InvalidOperationException(
                 $"Полная публикация требует delta_seq=0, получено {state.DeltaSeq}. " +
                 "Сначала выполните полную миграцию.");
 
-        var localSnapshot = await ReadSnapshotAsync(local, state);
+        phaseTimer.Restart();
+        var localSnapshot = await ReadSnapshotAsync(local, state, "локально");
+        LogProfile(state.BaselineId, "Контрольный снимок локальной базы — всего", phaseTimer,
+            $"объектов: {localSnapshot.Count:N0}");
+
+        phaseTimer.Restart();
         await ValidateHostingConnectionAsync(hostingBuilder.ConnectionString);
+        LogProfile(state.BaselineId, "Проверка подключения к хостингу", phaseTimer);
 
         var baseWorkDirectory = string.IsNullOrWhiteSpace(configuredWorkDirectory)
             ? Path.Combine(Path.GetTempPath(), "berg-sync-transfer")
@@ -63,21 +73,26 @@ internal static class HostingPublisher
         var archivePath = Path.Combine(workDirectory, archiveName);
         var checksumPath = archivePath + ".sha256";
 
+        phaseTimer.Restart();
         if (Directory.Exists(workDirectory))
             Directory.Delete(workDirectory, recursive: true);
         Directory.CreateDirectory(workDirectory);
+        LogProfile(state.BaselineId, "Подготовка рабочего каталога", phaseTimer);
 
         var success = false;
         try
         {
             Console.WriteLine("Создание directory-format dump...");
+            phaseTimer.Restart();
             var pgEnvironment = BuildPostgresEnvironment(localBuilder);
             await RunProcessAsync("pg_dump.exe",
                 ["--format=directory", "--compress=none", "--jobs=4", "--no-owner", "--no-acl",
                  "--schema=bergauto", "--schema=bergapp", "--schema=berg_sync",
                  $"--file={dumpDirectory}", localBuilder.Database!],
                 pgEnvironment);
+            LogProfile(state.BaselineId, "Создание directory-format dump", phaseTimer);
 
+            phaseTimer.Restart();
             var manifest = new FullTransferManifest
             {
                 BaselineId = state.BaselineId,
@@ -90,12 +105,19 @@ internal static class HostingPublisher
                 manifestPath,
                 JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }),
                 new UTF8Encoding(false));
+            LogProfile(state.BaselineId, "Формирование manifest", phaseTimer,
+                $"объектов: {manifest.Relations.Count:N0}");
 
             Console.WriteLine("Создание TAR...");
+            phaseTimer.Restart();
             await RunProcessAsync("tar.exe",
                 ["-cf", tarPath, "-C", workDirectory, "bergdb-dump", "manifest.json"]);
+            var tarSize = new FileInfo(tarPath).Length;
+            LogProfile(state.BaselineId, "Создание TAR", phaseTimer,
+                $"размер: {tarSize:N0} байт");
 
             Console.WriteLine($"Сжатие Zstandard, уровень {zstdLevel}...");
+            phaseTimer.Restart();
             var zstdArguments = new List<string>();
             if (zstdLevel > 19) zstdArguments.Add("--ultra");
             zstdArguments.Add($"-{zstdLevel}");
@@ -105,26 +127,48 @@ internal static class HostingPublisher
             zstdArguments.Add("-o");
             zstdArguments.Add(archivePath);
             await RunProcessAsync("zstd.exe", zstdArguments);
+            var archiveSize = new FileInfo(archivePath).Length;
             File.Delete(tarPath);
+            LogProfile(state.BaselineId, "Сжатие Zstandard", phaseTimer,
+                $"{tarSize:N0} → {archiveSize:N0} байт; коэффициент: {(double)archiveSize / tarSize:P1}");
 
+            phaseTimer.Restart();
             await RunProcessAsync("zstd.exe", ["--test", archivePath]);
             var checksum = await CalculateSha256Async(archivePath);
             await File.WriteAllTextAsync(
                 checksumPath, $"{checksum}  {archiveName}\n", new UTF8Encoding(false));
-            Console.WriteLine($"Архив: {new FileInfo(archivePath).Length:N0} байт");
+            Console.WriteLine($"Архив: {archiveSize:N0} байт");
+            LogProfile(state.BaselineId, "Проверка архива и расчёт SHA-256", phaseTimer);
 
+            phaseTimer.Restart();
             await EnsureRemoteDirectoryAsync(sshTarget, remoteDirectory);
+            LogProfile(state.BaselineId, "Подготовка удалённого каталога", phaseTimer);
+
+            phaseTimer.Restart();
             await UploadWithResumeAsync(
                 sshTarget, archivePath, $"{remoteDirectory}/{archiveName}.uploading", transferRetries);
+            var uploadSeconds = Math.Max(phaseTimer.Elapsed.TotalSeconds, 0.001);
+            LogProfile(state.BaselineId, "Загрузка архива по SFTP", phaseTimer,
+                $"размер: {archiveSize:N0} байт; скорость: {archiveSize / uploadSeconds / 1024 / 1024:N2} МиБ/с");
+
+            phaseTimer.Restart();
             await ActivateArchiveAsync(
                 sshTarget, remoteDirectory, remoteScript, archiveName, checksum);
+            LogProfile(state.BaselineId, "Удалённая проверка и восстановление", phaseTimer);
 
             Console.WriteLine("Проверка базы на хостинге...");
+            phaseTimer.Restart();
             await using var hosting = new NpgsqlConnection(hostingBuilder.ConnectionString);
             await hosting.OpenAsync();
             var remoteState = await ReadStateAsync(hosting);
-            var remoteSnapshot = await ReadSnapshotAsync(hosting, remoteState);
+            LogProfile(state.BaselineId, "Подключение и чтение состояния хостинга", phaseTimer,
+                $"baseline: {remoteState.BaselineId}; delta_seq: {remoteState.DeltaSeq}");
+
+            phaseTimer.Restart();
+            var remoteSnapshot = await ReadSnapshotAsync(hosting, remoteState, "хостинг");
             CompareSnapshots(localSnapshot, remoteSnapshot, state, remoteState);
+            LogProfile(state.BaselineId, "Контрольный снимок и сравнение хостинга — всего", phaseTimer,
+                $"объектов: {remoteSnapshot.Count:N0}");
 
             success = true;
             Console.WriteLine("Полная публикация и проверка завершены успешно.");
@@ -132,10 +176,15 @@ internal static class HostingPublisher
         }
         finally
         {
+            phaseTimer.Restart();
             if (success)
                 Directory.Delete(workDirectory, recursive: true);
             else
                 Console.Error.WriteLine($"Файлы неуспешной публикации сохранены: {workDirectory}");
+            LogProfile(state.BaselineId, "Очистка рабочего каталога", phaseTimer,
+                success ? "успешная публикация" : "файлы сохранены для диагностики");
+            LogProfile(state.BaselineId, "Полная публикация — всего", totalTimer,
+                success ? "успешно" : "ошибка");
         }
     }
 
@@ -245,23 +294,31 @@ internal static class HostingPublisher
     }
 
     private static async Task<Dictionary<string, RelationSnapshot>> ReadSnapshotAsync(
-        NpgsqlConnection connection, SyncStateSnapshot state)
+        NpgsqlConnection connection, SyncStateSnapshot state, string target)
     {
         var result = new Dictionary<string, RelationSnapshot>(StringComparer.OrdinalIgnoreCase);
         foreach (var table in IdTables)
         {
+            var timer = Stopwatch.StartNew();
             await using var command = connection.CreateCommand();
             command.CommandText = $"SELECT COUNT(*), COALESCE(MAX(\"ID\"),0) FROM bergauto.{Quote(table)}";
             await using var reader = await command.ExecuteReaderAsync();
             await reader.ReadAsync();
-            result[$"bergauto.{table}"] = new RelationSnapshot(reader.GetInt64(0), reader.GetInt64(1));
+            var snapshot = new RelationSnapshot(reader.GetInt64(0), reader.GetInt64(1));
+            result[$"bergauto.{table}"] = snapshot;
+            LogProfile(state.BaselineId, $"Снимок {target}: bergauto.{table}", timer,
+                $"строк: {snapshot.Count:N0}; max ID: {snapshot.MaxId:N0}");
         }
         foreach (var relation in CountOnlyRelations)
         {
+            var timer = Stopwatch.StartNew();
             await using var command = connection.CreateCommand();
             command.CommandText = $"SELECT COUNT(*) FROM {relation}";
             var count = Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
-            result[relation.Replace("\"", string.Empty, StringComparison.Ordinal)] = new RelationSnapshot(count, null);
+            var key = relation.Replace("\"", string.Empty, StringComparison.Ordinal);
+            result[key] = new RelationSnapshot(count, null);
+            LogProfile(state.BaselineId, $"Снимок {target}: {key}", timer,
+                $"строк: {count:N0}");
         }
         return result;
     }
@@ -356,6 +413,14 @@ internal static class HostingPublisher
         await using var stream = File.OpenRead(path);
         var hash = await System.Security.Cryptography.SHA256.HashDataAsync(stream);
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static void LogProfile(
+        string operationId, string operation, Stopwatch stopwatch, string? details = null)
+    {
+        stopwatch.Stop();
+        Console.WriteLine($"[PROFILE] [{operationId}] {operation}: {stopwatch.Elapsed.TotalMilliseconds:N0} мс" +
+                          (string.IsNullOrWhiteSpace(details) ? string.Empty : $"; {details}"));
     }
 
     private static string RequireEnvironment(string name)
