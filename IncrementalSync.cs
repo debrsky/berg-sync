@@ -27,7 +27,9 @@ internal static class IncrementalSync
         int maxChanges,
         bool recalculate,
         bool refreshViews,
-        string sourcePath)
+        string sourcePath,
+        bool syncHosting,
+        string? packageDirectory)
     {
         var timer = Stopwatch.StartNew();
         var schema = LoadSchema();
@@ -44,6 +46,17 @@ internal static class IncrementalSync
         Console.WriteLine("  удаления: не применяются");
 
         await EnsureTargetAsync(postgres, schema);
+        var packageRoot = RemoteDeltaDelivery.ResolvePackageRoot(packageDirectory);
+        string? hostingConnectionString = null;
+        if (syncHosting)
+        {
+            hostingConnectionString = Environment.GetEnvironmentVariable("PG_HOSTING_CONNECTION_STRING");
+            if (string.IsNullOrWhiteSpace(hostingConnectionString))
+                throw new ArgumentException("Для --sync-hosting задайте PG_HOSTING_CONNECTION_STRING.");
+            await RemoteDeltaDelivery.DeliverPendingAsync(
+                postgres, hostingConnectionString, packageRoot, schema, recalculate, refreshViews);
+        }
+
         var targetMax = await ReadTargetMaxIdsAsync(postgres);
         var sourceMax = ReadSourceMaxIds(access);
         ValidateFreshness(sourceMax, targetMax);
@@ -92,7 +105,31 @@ internal static class IncrementalSync
         }
 
         await BuildAffectedPairsAsync(postgres, transaction);
-        var affectedPairs = await ScalarInt64Async(postgres, "SELECT COUNT(*) FROM delta_affected_pairs", transaction);
+        var affectedPairList = await ReadAffectedPairsAsync(postgres, transaction);
+        var affectedPairs = affectedPairList.Count;
+
+        var changedRows = new Dictionary<string, IReadOnlyList<object?[]>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var table in DataTables)
+        {
+            var changedIds = await ReadChangedIdsAsync(postgres, transaction, table, schema.Tables[table]);
+            changedRows[table] = changedIds.Select(id => candidates[table][id].Values).ToArray();
+        }
+
+        var nextSeq = state.DeltaSeq + 1;
+        var patchId = $"{state.BaselineId}-delta-{nextSeq:0000}";
+        var packageCounts = changes.ToDictionary(
+            pair => pair.Key,
+            pair => new DeltaTableCount(pair.Value.Inserted, pair.Value.Updated),
+            StringComparer.OrdinalIgnoreCase);
+        string? packagePath = null;
+        if (syncHosting)
+        {
+            packagePath = await RemoteDeltaDelivery.WritePackageAsync(
+                packageRoot, patchId, state.BaselineId, state.DeltaSeq, nextSeq,
+                sourcePath, periodStart, dateOffsetHours, changedRows,
+                affectedPairList, packageCounts, sourceMax, schema);
+            Console.WriteLine($"Пакет дельты: {packagePath}");
+        }
 
         foreach (var table in DataTables)
             await UpsertAsync(postgres, transaction, table, schema.Tables[table]);
@@ -132,11 +169,7 @@ internal static class IncrementalSync
                 await ExecuteAsync(postgres, $"REFRESH MATERIALIZED VIEW bergapp.{Quote(view)}", transaction);
         }
 
-        var nextSeq = state.DeltaSeq + 1;
-        var patchId = $"{state.BaselineId}-delta-{nextSeq:0000}";
-        var countsJson = JsonSerializer.Serialize(changes.ToDictionary(
-            pair => pair.Key,
-            pair => new { inserted = pair.Value.Inserted, updated = pair.Value.Updated }));
+        var countsJson = JsonSerializer.Serialize(packageCounts);
         var maxJson = JsonSerializer.Serialize(sourceMax);
 
         await using (var command = postgres.CreateCommand())
@@ -160,6 +193,22 @@ internal static class IncrementalSync
         {
             command.Transaction = transaction;
             command.CommandText = """
+                INSERT INTO berg_sync.patch_delivery
+                  (patch_id,target,status,attempts,applied_at)
+                VALUES ($1,'local','applied',1,current_timestamp),
+                       ($1,'hosting',$2,0,NULL)
+                ON CONFLICT (patch_id,target) DO UPDATE SET
+                  status=excluded.status,
+                  applied_at=excluded.applied_at
+                """;
+            command.Parameters.AddWithValue(patchId);
+            command.Parameters.AddWithValue(syncHosting ? "pending" : "not_requested");
+            await command.ExecuteNonQueryAsync();
+        }
+        await using (var command = postgres.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
                 UPDATE berg_sync.state
                 SET delta_seq=$1, source_mdb=$2, source_max_ids=$3::jsonb, updated_at=current_timestamp
                 WHERE id=1
@@ -171,10 +220,20 @@ internal static class IncrementalSync
         }
 
         await transaction.CommitAsync();
+
+        if (syncHosting)
+        {
+            var package = await RemoteDeltaDelivery.LoadPackageAsync(packageRoot, patchId);
+            await RemoteDeltaDelivery.DeliverAndRecordAsync(
+                postgres, hostingConnectionString!, package, schema, recalculate, refreshViews);
+        }
+
         timer.Stop();
         Console.WriteLine($"\nПрименён локальный патч: {patchId}");
         Console.WriteLine($"Изменено строк: {totalChanges:N0}; затронуто пар: {affectedPairs:N0}; время: {timer.Elapsed}");
-        Console.WriteLine("На хостинг данные не отправлялись.");
+        Console.WriteLine(syncHosting
+            ? "Тот же пакет применён на хостинге."
+            : "На хостинг данные не отправлялись.");
     }
 
     private static Dictionary<string, Dictionary<int, SourceRow>> ReadCandidates(
@@ -508,6 +567,19 @@ internal static class IncrementalSync
             """, transaction);
     }
 
+    private static async Task<List<AffectedPair>> ReadAffectedPairsAsync(
+        NpgsqlConnection postgres, NpgsqlTransaction transaction)
+    {
+        var result = new List<AffectedPair>();
+        await using var command = postgres.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT id_payer,id_seller FROM delta_affected_pairs ORDER BY id_payer,id_seller";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            result.Add(new AffectedPair(reader.GetInt32(0), reader.GetInt32(1)));
+        return result;
+    }
+
     private static async Task EnsureTargetAsync(NpgsqlConnection postgres, MigrationSchema schema)
     {
         foreach (var table in DataTables)
@@ -581,6 +653,15 @@ internal static class IncrementalSync
               counts jsonb NOT NULL,
               affected_pairs bigint NOT NULL,
               created_at timestamp with time zone NOT NULL DEFAULT current_timestamp
+            );
+            CREATE TABLE IF NOT EXISTS berg_sync.patch_delivery (
+              patch_id text NOT NULL,
+              target text NOT NULL,
+              status text NOT NULL,
+              attempts integer NOT NULL DEFAULT 0,
+              last_error text,
+              applied_at timestamp with time zone,
+              PRIMARY KEY (patch_id, target)
             );
             """, transaction);
 

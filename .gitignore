@@ -3,3 +3,5 @@ obj/
 .env
 .env.*
 !.env.sample
+.mcp.json
+delta-packages/

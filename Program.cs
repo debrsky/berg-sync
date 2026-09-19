@@ -17,10 +17,14 @@ try
         return 0;
     }
 
-    if (string.IsNullOrWhiteSpace(options.MdbPath))
-        throw new ArgumentException("Укажите путь к MDB через --mdb <путь>.");
+    var configuredMdbPath = !string.IsNullOrWhiteSpace(options.MdbPath)
+        ? options.MdbPath
+        : Environment.GetEnvironmentVariable("MDB_PATH");
+    if (string.IsNullOrWhiteSpace(configuredMdbPath))
+        throw new ArgumentException(
+            "Укажите путь к MDB через --mdb <путь> или переменную MDB_PATH.");
 
-    var mdbPath = Path.GetFullPath(options.MdbPath);
+    var mdbPath = Path.GetFullPath(configuredMdbPath);
     if (!File.Exists(mdbPath))
         throw new FileNotFoundException("MDB-файл не найден.", mdbPath);
 
@@ -33,6 +37,7 @@ try
 
     if (options.FullMigration)
     {
+        var baselineId = $"{DateTime.Now:yyyy-MM-dd-HHmmss}-full";
         await FullMigration.RunAsync(
             connection,
             ResolvePostgresConnectionString(options),
@@ -41,7 +46,30 @@ try
             options.SqlDirectory,
             options.MigrationLimit,
             options.MdbDateOffsetHours,
-            options.ConfirmDrop);
+            options.ConfirmDrop,
+            mdbPath,
+            baselineId);
+
+        if (options.PublishHosting)
+            await HostingPublisher.RunAsync(
+                ResolvePostgresConnectionString(options),
+                options.PgDatabase,
+                options.ConfirmHostingRestore,
+                options.TransferWorkDirectory,
+                options.TransferRetries,
+                options.ZstdLevel);
+        return 0;
+    }
+
+    if (options.PublishHosting)
+    {
+        await HostingPublisher.RunAsync(
+            ResolvePostgresConnectionString(options),
+            options.PgDatabase,
+            options.ConfirmHostingRestore,
+            options.TransferWorkDirectory,
+            options.TransferRetries,
+            options.ZstdLevel);
         return 0;
     }
 
@@ -60,7 +88,9 @@ try
             options.DeltaMaxChanges,
             !options.SkipRecalculate,
             !options.SkipRefreshViews,
-            mdbPath);
+            mdbPath,
+            options.SyncHosting,
+            options.DeltaPackageDirectory);
         return 0;
     }
 
@@ -351,12 +381,12 @@ static string ResolvePostgresConnectionString(Options options)
     if (!string.IsNullOrWhiteSpace(options.PgConnectionString))
         return options.PgConnectionString;
 
-    var fromEnvironment = Environment.GetEnvironmentVariable("PG_CONNECTION_STRING");
+    var fromEnvironment = Environment.GetEnvironmentVariable("PG_LOCAL_CONNECTION_STRING");
     if (!string.IsNullOrWhiteSpace(fromEnvironment))
         return fromEnvironment;
 
     throw new ArgumentException(
-        "Для переноса задайте строку PostgreSQL через --pg или переменную PG_CONNECTION_STRING.");
+        "Для переноса задайте строку PostgreSQL через --pg или переменную PG_LOCAL_CONNECTION_STRING.");
 }
 
 static string QuoteAccessIdentifier(string identifier) =>
@@ -432,6 +462,13 @@ sealed record Options(
     bool Replace,
     bool FullMigration,
     bool Incremental,
+    bool SyncHosting,
+    string? DeltaPackageDirectory,
+    bool PublishHosting,
+    bool ConfirmHostingRestore,
+    string? TransferWorkDirectory,
+    int TransferRetries,
+    int ZstdLevel,
     string PgDatabase,
     string PgAdminDatabase,
     string? SqlDirectory,
@@ -463,6 +500,13 @@ sealed record Options(
         var replace = false;
         var fullMigration = false;
         var incremental = false;
+        var syncHosting = false;
+        string? deltaPackageDirectory = null;
+        var publishHosting = false;
+        var confirmHostingRestore = false;
+        string? transferWorkDirectory = null;
+        var transferRetries = 20;
+        var zstdLevel = 17;
         var pgDatabase = "bergdb";
         var pgAdminDatabase = "postgres";
         string? sqlDirectory = null;
@@ -496,6 +540,13 @@ sealed record Options(
                 case "--replace": replace = true; break;
                 case "--migrate": fullMigration = true; break;
                 case "--incremental" or "--delta": incremental = true; break;
+                case "--sync-hosting": syncHosting = true; break;
+                case "--delta-package-dir": deltaPackageDirectory = NextValue(args, ref index, "--delta-package-dir"); break;
+                case "--publish-hosting": publishHosting = true; break;
+                case "--confirm-hosting-restore": confirmHostingRestore = true; break;
+                case "--transfer-work-dir": transferWorkDirectory = NextValue(args, ref index, "--transfer-work-dir"); break;
+                case "--transfer-retries": transferRetries = ParsePositive(NextValue(args, ref index, "--transfer-retries"), "--transfer-retries"); break;
+                case "--zstd-level": zstdLevel = ParseRange(NextValue(args, ref index, "--zstd-level"), "--zstd-level", 1, 22); break;
                 case "--pg-database": pgDatabase = NextValue(args, ref index, "--pg-database"); break;
                 case "--pg-admin-database": pgAdminDatabase = NextValue(args, ref index, "--pg-admin-database"); break;
                 case "--sql-dir": sqlDirectory = NextValue(args, ref index, "--sql-dir"); break;
@@ -521,10 +572,16 @@ sealed record Options(
         var selectedModes = (fullMigration ? 1 : 0) + (incremental ? 1 : 0) + (copyToPostgres ? 1 : 0);
         if (selectedModes > 1)
             throw new ArgumentException("Используйте только один режим: --migrate, --incremental или --copy.");
+        if (publishHosting && (incremental || copyToPostgres))
+            throw new ArgumentException("--publish-hosting совместим только с --migrate или отдельным запуском.");
+        if (syncHosting && !incremental)
+            throw new ArgumentException("--sync-hosting используется вместе с --incremental.");
 
         return new Options(mdbPath, table, limit, countRows, provider, copyToPostgres,
             pgConnectionString, pgSchema, pgTable, copyLimit, replace, fullMigration,
-            incremental, pgDatabase, pgAdminDatabase, sqlDirectory, migrationLimit,
+            incremental, syncHosting, deltaPackageDirectory,
+            publishHosting, confirmHostingRestore, transferWorkDirectory,
+            transferRetries, zstdLevel, pgDatabase, pgAdminDatabase, sqlDirectory, migrationLimit,
             mdbDateOffsetHours, confirmDrop, periodDays, idOverlap, paymentIdOverlap,
             invoiceDataIdOverlap, fullCustomers, deltaMaxChanges, skipRecalculate,
             skipRefreshViews, showHelp);
@@ -536,7 +593,10 @@ sealed record Options(
             Berg Sync: чтение MDB и миграция в PostgreSQL.
 
             Использование:
-              dotnet run --project . -- --mdb <файл.mdb> [параметры]
+              dotnet run --project . -- [--mdb <файл.mdb>] [параметры]
+
+            Источник MDB:
+              --mdb <путь>        Путь к MDB; имеет приоритет над MDB_PATH из окружения
 
             Чтение MDB:
               --table <имя>       Выбранная таблица
@@ -546,7 +606,7 @@ sealed record Options(
 
             Перенос PostgreSQL:
               --copy              Включить перенос выбранной таблицы
-              --pg <строка>       Строка подключения (или PG_CONNECTION_STRING)
+              --pg <строка>       Строка подключения (или PG_LOCAL_CONNECTION_STRING)
               --pg-schema <имя>   Целевая схема, по умолчанию mdb_poc
               --pg-table <имя>    Целевая таблица, по умолчанию имя MDB-таблицы
               --copy-limit <N>    Число переносимых строк; 0 = все, по умолчанию 1000
@@ -561,6 +621,13 @@ sealed record Options(
               --mdb-date-offset-hours N  Вычесть часов из MDB-дат; по умолчанию 10
               --confirm-drop             Подтвердить удаление bergauto и bergapp
 
+            Полная публикация на хостинг:
+              --publish-hosting          Создать dump, загрузить по SFTP и восстановить
+              --confirm-hosting-restore  Подтвердить замену схем на хостинге
+              --transfer-work-dir <путь> Рабочий каталог; по умолчанию системный TEMP
+              --transfer-retries <N>     Попытки SFTP-докачки, по умолчанию 20
+              --zstd-level <1..22>       Уровень сжатия, по умолчанию 17
+
             Инкрементальная выгрузка в локальный PostgreSQL:
               --incremental, --delta     Применить безопасную INSERT/UPDATE-дельту
               --period-days <N>          Скользящий период, по умолчанию 90
@@ -571,6 +638,8 @@ sealed record Options(
               --delta-max-changes <N>    Защитный лимит, по умолчанию 100000
               --skip-recalculate         Не пересчитывать bergapp.operations
               --skip-refresh-views       Не обновлять materialized views
+              --sync-hosting             Доставить тот же пакет на хостинг
+              --delta-package-dir <путь> Каталог неизменяемых delta-пакетов
 
               --help, -h          Показать справку
             """);
@@ -587,6 +656,13 @@ sealed record Options(
     {
         if (!int.TryParse(value, out var result) || (allowZero ? result < 0 : result <= 0))
             throw new ArgumentException($"{option} должен быть {(allowZero ? "неотрицательным" : "положительным")} целым числом.");
+        return result;
+    }
+
+    private static int ParseRange(string value, string option, int minimum, int maximum)
+    {
+        if (!int.TryParse(value, out var result) || result < minimum || result > maximum)
+            throw new ArgumentException($"{option} должен быть целым числом от {minimum} до {maximum}.");
         return result;
     }
 

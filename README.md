@@ -4,8 +4,12 @@
 инкрементальной синхронизации. Проект никогда не изменяет MDB. PostgreSQL
 изменяется только при явном указании `--copy`, `--migrate` или `--incremental`.
 
-Подробное описание алгоритмов, транзакционных границ, состояния синхронизации и
-ограничений: [SYNC_WORKFLOW.md](SYNC_WORKFLOW.md).
+Документация:
+
+- [OPERATION_TASKS.md](OPERATION_TASKS.md) — подробное описание выполняемых задач,
+  команд, восстановления после ошибок и рекомендуемого расписания;
+- [SYNC_WORKFLOW.md](SYNC_WORKFLOW.md) — алгоритмы, транзакционные границы,
+  состояние синхронизации и ограничения.
 
 ## Требования
 
@@ -40,15 +44,23 @@ cp .env.sample .env
 `BERG_SYNC_ENV_FILE`. Приоритет настроек:
 
 1. аргумент `--pg`;
-2. переменная процесса `PG_CONNECTION_STRING`;
-3. значение `PG_CONNECTION_STRING` из `.env`.
+2. переменная процесса `PG_LOCAL_CONNECTION_STRING`;
+3. значение `PG_LOCAL_CONNECTION_STRING` из `.env`.
 
-`PG_HOSTING_CONNECTION_STRING` подготовлена для будущей выгрузки на хостинг и
-текущей версией пока не используется. Файл `.env` игнорируется Git.
+Путь к исходной базе задаётся через `MDB_PATH`. Аргумент `--mdb` имеет над ним
+приоритет. Для полной доставки на хостинг используются `HOSTING_SSH_TARGET`,
+`HOSTING_TRANSFER_DIR`, `HOSTING_RESTORE_SCRIPT` и
+`PG_HOSTING_CONNECTION_STRING`. Файл `.env` игнорируется Git.
 
 ## Запуск из `C:\WORK\berg_sync`
 
 Показать таблицы:
+
+```bash
+dotnet run --project . --
+```
+
+В примере используется `MDB_PATH` из `.env`. Другой файл можно указать явно:
 
 ```bash
 dotnet run --project . -- \
@@ -87,7 +99,7 @@ dotnet run --project . -- \
 Строку подключения безопаснее передать через окружение:
 
 ```bash
-export PG_CONNECTION_STRING='Host=localhost;Port=5432;Database=bergdb;Username=postgres;Password=secret'
+export PG_LOCAL_CONNECTION_STRING='Host=localhost;Port=5432;Database=bergdb;Username=postgres;Password=secret'
 ```
 
 Перенос первых 1000 строк с пересозданием тестовой таблицы:
@@ -118,12 +130,12 @@ dotnet run --project . -- \
 4. переносит данные бинарным `COPY`, каждая таблица — в отдельной транзакции;
 5. создаёт 41 индекс и выполняет `ANALYZE`;
 6. рассчитывает `bergapp.operations`;
-7. создаёт materialized views и объекты `berg_persistent`.
+7. создаёт materialized views.
 
 Запуск из корня проекта:
 
 ```bash
-export PG_CONNECTION_STRING='Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=secret'
+export PG_LOCAL_CONNECTION_STRING='Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=secret'
 
 dotnet run --project . -- \
   --mdb C:/WORK/BERG/Berg/DB/bergauto.mdb \
@@ -136,13 +148,12 @@ dotnet run --project . -- \
 ```
 
 `--confirm-drop` обязателен: миграция удаляет `bergauto`, `bergapp` и состояние
-предыдущего baseline в `berg_sync` с `CASCADE`. Схема `berg_persistent` сохраняется. Значение `--mdb-date-offset-hours 10`
+предыдущего baseline в `berg_sync` с `CASCADE`. Значение `--mdb-date-offset-hours 10`
 повторяет преобразование дат из `migrate.js`; для переноса локального Access-времени
 без коррекции укажите `0`.
 
 В отличие от текущего `migrate.js`, .NET-версия прекращает выполнение при первой
-ошибке. Процедура
-`berg_persistent.archive_invoices()` создаётся, но автоматически не вызывается.
+ошибке.
 
 Расчёт операций использует отдельный исправленный файл
 `sql/get-operations.sql`. В нём:
@@ -158,19 +169,58 @@ dotnet run --project . -- \
 node generate-migration-schema.mjs
 ```
 
+## Полная публикация на хостинг
+
+После полной миграции локальную базу можно опубликовать на хостинг:
+
+```bash
+dotnet run --project . -- \
+  --migrate \
+  --confirm-drop \
+  --publish-hosting \
+  --confirm-hosting-restore
+```
+
+Также можно опубликовать уже подготовленную локальную базу с `delta_seq = 0`:
+
+```bash
+dotnet run --project . -- \
+  --publish-hosting \
+  --confirm-hosting-restore
+```
+
+Публикация:
+
+1. проверяет локальный baseline и подключение к хостингу;
+2. создаёт directory-format dump схем `bergauto`, `bergapp`, `berg_sync`;
+3. формирует manifest, TAR.ZST и SHA-256;
+4. загружает архив через SFTP с докачкой `reput`;
+5. проверяет удалённый SHA-256 и атомарно активирует архив;
+6. запускает `HOSTING_RESTORE_SCRIPT`;
+7. сравнивает baseline, `COUNT(*)` и `MAX(ID)` локальной и удалённой баз.
+
+`--confirm-hosting-restore` обязателен, поскольку на хостинге схемы заменяются.
+При ошибке локальные файлы поставки сохраняются для диагностики.
+
 ## Инкрементальная выгрузка в локальный PostgreSQL
 
 Сначала нужна полная миграция. После неё изменения из более свежего MDB можно
 применить без пересоздания базы:
 
 ```bash
-export PG_CONNECTION_STRING='Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=secret'
+export PG_LOCAL_CONNECTION_STRING='Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=secret'
 
 dotnet run --project . -- \
   --mdb C:/WORK/BERG/Berg/DB/bergauto.mdb \
   --incremental \
   --pg-database bergdb \
   --mdb-date-offset-hours 10
+```
+
+Для применения одной и той же дельты локально и на хостинге добавьте:
+
+```powershell
+--sync-hosting
 ```
 
 Режим `--incremental` (алиас `--delta`):
@@ -184,7 +234,10 @@ dotnet run --project . -- \
 - пересчитывает затронутые финансовые пары и обновляет materialized views;
 - ведёт baseline, последовательность и журнал запусков в схеме `berg_sync`;
 - отклоняет MDB, у которого максимальные ID меньше локальной базы;
-- ничего не отправляет на хостинг.
+- с `--sync-hosting` создаёт неизменяемый пакет с SHA-256, применяет его локально,
+  затем к `PG_HOSTING_CONNECTION_STRING`;
+- сохраняет состояние доставки в `berg_sync.patch_delivery`;
+- при следующем запуске сначала повторяет доставку pending/failed-пакетов.
 
 Полезные параметры:
 
@@ -197,6 +250,8 @@ dotnet run --project . -- \
 --delta-max-changes 100000
 --skip-recalculate
 --skip-refresh-views
+--sync-hosting
+--delta-package-dir C:/WORK/berg_sync/delta-packages
 ```
 
 `--full-customers` предназначен для более редкого полного прохода `Customers`

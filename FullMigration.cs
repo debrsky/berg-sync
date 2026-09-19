@@ -13,16 +13,14 @@ internal static class FullMigration
         "operations/calculate-and-save-operations.sql"
     ];
 
-    private static readonly string[] ViewAndPersistentScripts =
+    private static readonly string[] ViewScripts =
     [
         "views/payers.sql",
         "views/sellers.sql",
         "views/invoices.sql",
         "views/counterparties.sql",
         "views/balances.sql",
-        "views/debt_invoices.sql",
-        "persistent/archived_invoices.sql",
-        "persistent/archive_invoices.sql"
+        "views/debt_invoices.sql"
     ];
 
     public static async Task RunAsync(
@@ -33,7 +31,9 @@ internal static class FullMigration
         string? sqlDirectory,
         int rowLimit,
         double dateOffsetHours,
-        bool confirmDrop)
+        bool confirmDrop,
+        string sourcePath,
+        string baselineId)
     {
         if (!confirmDrop)
             throw new ArgumentException(
@@ -122,9 +122,12 @@ internal static class FullMigration
             postgres, "SELECT COUNT(*) FROM bergapp.operations");
         Console.WriteLine($"Операций: {operationCount:N0}");
 
-        Console.WriteLine("\nСоздание materialized views и постоянных таблиц...");
-        foreach (var script in ViewAndPersistentScripts)
+        Console.WriteLine("\nСоздание materialized views...");
+        foreach (var script in ViewScripts)
             await ExecuteScriptAsync(postgres, sqlRoot, script);
+
+        await InitializeSyncStateAsync(
+            postgres, schema, baselineId, sourcePath, dateOffsetHours);
 
         totalTimer.Stop();
         Console.WriteLine("\n============================================================");
@@ -133,6 +136,64 @@ internal static class FullMigration
         Console.WriteLine($"Операций: {operationCount:N0}");
         Console.WriteLine($"Время: {totalTimer.Elapsed}");
         Console.WriteLine("============================================================");
+    }
+
+    private static async Task InitializeSyncStateAsync(
+        NpgsqlConnection postgres,
+        MigrationSchema schema,
+        string baselineId,
+        string sourcePath,
+        double dateOffsetHours)
+    {
+        Console.WriteLine($"Создание baseline: {baselineId}");
+        await ExecuteAsync(postgres, """
+            CREATE SCHEMA berg_sync;
+            CREATE TABLE berg_sync.state (
+              id integer PRIMARY KEY CHECK (id=1),
+              baseline_id text NOT NULL,
+              delta_seq bigint NOT NULL,
+              source_mdb text,
+              date_offset_hours double precision NOT NULL,
+              source_max_ids jsonb NOT NULL DEFAULT '{}'::jsonb,
+              updated_at timestamp with time zone NOT NULL DEFAULT current_timestamp
+            );
+            CREATE TABLE berg_sync.patches (
+              patch_id text PRIMARY KEY,
+              baseline_id text NOT NULL,
+              delta_seq bigint NOT NULL,
+              source_mdb text,
+              period_start timestamp without time zone NOT NULL,
+              counts jsonb NOT NULL,
+              affected_pairs bigint NOT NULL,
+              created_at timestamp with time zone NOT NULL DEFAULT current_timestamp
+            );
+            CREATE TABLE berg_sync.patch_delivery (
+              patch_id text NOT NULL,
+              target text NOT NULL,
+              status text NOT NULL,
+              attempts integer NOT NULL DEFAULT 0,
+              last_error text,
+              applied_at timestamp with time zone,
+              PRIMARY KEY (patch_id, target)
+            );
+            """);
+
+        var maxima = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        foreach (var table in new[] { "Customers", "Applications", "XInvoices", "XInvoicePays", "XInvoiceDatas" })
+            maxima[table] = await ExecuteScalarInt64Async(
+                postgres, $"SELECT COALESCE(MAX(\"ID\"),0) FROM bergauto.{QuoteIdentifier(table)}");
+
+        await using var command = postgres.CreateCommand();
+        command.CommandText = """
+            INSERT INTO berg_sync.state
+              (id,baseline_id,delta_seq,source_mdb,date_offset_hours,source_max_ids)
+            VALUES (1,$1,0,$2,$3,$4::jsonb)
+            """;
+        command.Parameters.AddWithValue(baselineId);
+        command.Parameters.AddWithValue(sourcePath);
+        command.Parameters.AddWithValue(dateOffsetHours);
+        command.Parameters.AddWithValue(JsonSerializer.Serialize(maxima));
+        await command.ExecuteNonQueryAsync();
     }
 
     private static MigrationSchema LoadSchema()
