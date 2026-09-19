@@ -33,7 +33,7 @@ try
     using var connection = OpenAccessDatabase(mdbPath, options.Provider);
 
     if (options.Tui)
-        return await IncrementalTui.RunAsync(
+        return await SyncTui.RunAsync(
             connection, mdbPath, ResolvePostgresConnectionString(options), options);
 
     Console.WriteLine($"MDB: {mdbPath}");
@@ -586,7 +586,7 @@ sealed record Options(
         if (syncHosting && !incremental)
             throw new ArgumentException("--sync-hosting используется вместе с --incremental.");
         if (tui && (fullMigration || incremental || copyToPostgres || publishHosting || syncHosting))
-            throw new ArgumentException("--tui запускается отдельно и сам включает инкрементальную публикацию.");
+            throw new ArgumentException("--tui запускается отдельно; режим публикации выбирается в интерфейсе.");
         if (tui && !string.IsNullOrWhiteSpace(mdbPath))
             throw new ArgumentException("--tui использует только MDB_PATH; не задавайте --mdb.");
 
@@ -642,8 +642,8 @@ sealed record Options(
               --zstd-level <1..22>       Уровень сжатия, по умолчанию 17
 
             Интерактивный режим:
-              --tui                      Инкрементальная публикация на хостинг с TUI
-                                         (MDB берётся только из MDB_PATH)
+              --tui                      Выбрать инкрементальную или полную публикацию
+                                         (по умолчанию инкрементальная; MDB из MDB_PATH)
 
             Инкрементальная выгрузка в локальный PostgreSQL:
               --incremental, --delta     Применить безопасную INSERT/UPDATE-дельту
