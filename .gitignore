@@ -5,3 +5,4 @@ obj/
 !.env.sample
 .mcp.json
 delta-packages/
+artifacts/

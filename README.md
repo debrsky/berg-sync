@@ -143,14 +143,15 @@ dotnet run --project . -- \
   --pg-database bergdb \
   --pg-admin-database postgres \
   --migration-limit 0 \
-  --mdb-date-offset-hours 10 \
+  --mdb-date-offset-hours 0 \
   --confirm-drop
 ```
 
 `--confirm-drop` обязателен: миграция удаляет `bergauto`, `bergapp` и состояние
-предыдущего baseline в `berg_sync` с `CASCADE`. Значение `--mdb-date-offset-hours 10`
-повторяет преобразование дат из `migrate.js`; для переноса локального Access-времени
-без коррекции укажите `0`.
+предыдущего baseline в `berg_sync` с `CASCADE`. Access хранит локальное время без
+часового пояса, поэтому по умолчанию даты переносятся без коррекции
+(`--mdb-date-offset-hours 0`). Ненулевое значение следует задавать только для
+источника, которому действительно требуется фиксированный сдвиг.
 
 В отличие от текущего `migrate.js`, .NET-версия прекращает выполнение при первой
 ошибке.
@@ -220,7 +221,7 @@ dotnet run --project . -- \
   --mdb C:/WORK/BERG/Berg/DB/bergauto.mdb \
   --incremental \
   --pg-database bergdb \
-  --mdb-date-offset-hours 10
+  --mdb-date-offset-hours 0
 ```
 
 Для применения одной и той же дельты локально и на хостинге добавьте:

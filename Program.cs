@@ -518,7 +518,7 @@ sealed record Options(
         var pgAdminDatabase = "postgres";
         string? sqlDirectory = null;
         var migrationLimit = 0;
-        var mdbDateOffsetHours = 10d;
+        var mdbDateOffsetHours = 0d;
         var confirmDrop = false;
         var periodDays = 90;
         var idOverlap = 10_000;
@@ -631,7 +631,7 @@ sealed record Options(
               --pg-admin-database <имя>  Сервисная база, по умолчанию postgres
               --sql-dir <путь>           Каталог SQL; обычно находится автоматически
               --migration-limit <N>      Лимит строк каждой таблицы; 0 = все
-              --mdb-date-offset-hours N  Вычесть часов из MDB-дат; по умолчанию 10
+              --mdb-date-offset-hours N  Вычесть часов из MDB-дат; по умолчанию 0
               --confirm-drop             Подтвердить удаление bergauto и bergapp
 
             Полная публикация на хостинг:

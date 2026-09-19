@@ -58,13 +58,16 @@ Access хранит даты без информации о часовом по�
 дата PostgreSQL = дата MDB - mdb-date-offset-hours
 ```
 
-По умолчанию вычитается 10 часов:
+По умолчанию используется значение `0`: локальное время Access переносится без
+изменения.
 
 ```bash
---mdb-date-offset-hours 10
+--mdb-date-offset-hours 0
 ```
 
-Результат записывается как `timestamp without time zone`.
+Ненулевое значение следует задавать только для источника, которому действительно
+требуется фиксированный сдвиг. Результат записывается как
+`timestamp without time zone`.
 
 Полная и все последующие инкрементальные выгрузки обязаны использовать одно и
 то же значение. Инкрементальный режим сохраняет его в `berg_sync.state` и
@@ -82,7 +85,7 @@ dotnet run --project . -- \
   --migrate \
   --pg-database bergdb \
   --pg-admin-database postgres \
-  --mdb-date-offset-hours 10 \
+  --mdb-date-offset-hours 0 \
   --confirm-drop
 ```
 
@@ -216,7 +219,7 @@ dotnet run --project . -- \
   --mdb C:/WORK/BERG/Berg/DB/bergauto.mdb \
   --incremental \
   --pg-database bergdb \
-  --mdb-date-offset-hours 10
+  --mdb-date-offset-hours 0
 ```
 
 `--delta` является алиасом `--incremental`.
