@@ -46,8 +46,7 @@ node generate-migration-schema.mjs
 - функция `get_operations()`;
 - процедура `calculate_and_save_operations()`;
 - materialized views `payers`, `sellers`, `invoices`, `counterparties`,
-  `balances`, `debt_invoices`;
-- XML-функции.
+  `balances`, `debt_invoices`.
 
 Схема `berg_persistent` содержит постоянные объекты архива и не удаляется полной
 миграцией.
@@ -172,7 +171,7 @@ CALL bergapp.calculate_and_save_operations();
 
 ### 4.6. Представления и постоянные объекты
 
-После расчёта операций создаются materialized views, XML-функции и объекты
+После расчёта операций создаются materialized views и объекты
 `berg_persistent`.
 
 Полная миграция считается завершённой только после успешной установки всех этих

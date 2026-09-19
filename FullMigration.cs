@@ -21,9 +21,6 @@ internal static class FullMigration
         "views/counterparties.sql",
         "views/balances.sql",
         "views/debt_invoices.sql",
-        "functions/get-payers-xml.sql",
-        "functions/get-sellers-xml.sql",
-        "functions/get-balances-xml.sql",
         "persistent/archived_invoices.sql",
         "persistent/archive_invoices.sql"
     ];
@@ -125,7 +122,7 @@ internal static class FullMigration
             postgres, "SELECT COUNT(*) FROM bergapp.operations");
         Console.WriteLine($"Операций: {operationCount:N0}");
 
-        Console.WriteLine("\nСоздание materialized views, XML-функций и постоянных таблиц...");
+        Console.WriteLine("\nСоздание materialized views и постоянных таблиц...");
         foreach (var script in ViewAndPersistentScripts)
             await ExecuteScriptAsync(postgres, sqlRoot, script);
 
