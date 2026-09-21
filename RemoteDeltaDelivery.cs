@@ -370,6 +370,12 @@ internal static class RemoteDeltaDelivery
             }
         }
 
+        stageChanged?.Invoke("Архивация счетов на хостинге");
+        phaseTimer.Restart();
+        await ExecuteAsync(
+            hosting, transaction, "CALL berg_persistent.archive_invoices()");
+        LogProfile(package.PatchId, "Архивация счетов в berg_persistent на хостинге", phaseTimer);
+
         stageChanged?.Invoke("Фиксация и проверка публикации");
         phaseTimer.Restart();
 

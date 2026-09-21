@@ -164,6 +164,11 @@ internal static class FullMigration
         LogProfile("Создание состояния синхронизации", phaseTimer,
             $"baseline: {baselineId}");
 
+        phaseTimer.Restart();
+        Console.WriteLine("Архивация счетов в berg_persistent...");
+        await ExecuteAsync(postgres, "CALL berg_persistent.archive_invoices()");
+        LogProfile("Архивация счетов в berg_persistent", phaseTimer);
+
         totalTimer.Stop();
         Console.WriteLine($"[PROFILE] Полная миграция — всего: {totalTimer.Elapsed.TotalMilliseconds:N0} мс");
         Console.WriteLine("\n============================================================");

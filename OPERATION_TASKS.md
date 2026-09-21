@@ -248,8 +248,12 @@ HOSTING_RESTORE_SCRIPT <archive-name>
    ```
 9. проверяет ключевые объекты и `berg_sync.state`;
 10. требует `delta_seq = 0`;
-11. записывает marker `<baseline-id>.restored`;
-12. удаляет архив только после полного успеха.
+11. вызывает `berg_persistent.archive_invoices()`;
+12. записывает marker `<baseline-id>.restored`;
+13. удаляет архив только после полного успеха.
+
+Схема и процедура `berg_persistent` должны существовать заранее. Ошибка вызова
+считается ошибкой публикации.
 
 ### Итоговая проверка
 
@@ -336,8 +340,9 @@ dotnet run --project . -- `
 2. вычисляются финансовые пары;
 3. пересчитывается `operations`;
 4. обновляются materialized views;
-5. записывается patch;
-6. увеличивается `delta_seq`.
+5. вызывается `berg_persistent.archive_invoices()`;
+6. записывается patch;
+7. увеличивается `delta_seq`.
 
 Удаления не применяются.
 

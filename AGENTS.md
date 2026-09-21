@@ -65,7 +65,8 @@ dotnet run --project . -- --incremental --sync-hosting
 - После общей полной публикации не чередовать `--incremental` и `--incremental --sync-hosting`: последовательности баз разойдутся.
 - Pending/failed-пакеты доставляются до создания новой дельты.
 - Delta-пакеты неизменяемы (`package.json` + `package.sha256`) и автоматически не удаляются.
-- XML-функции и `berg_persistent` удалены и не должны возвращаться.
+- XML-функции удалены и не должны возвращаться.
+- `berg_persistent` не входит в dump и не пересоздаётся; после полной и инкрементальной синхронизации вызывается существующая `berg_persistent.archive_invoices()` локально и на хостинге.
 - Restore-скрипт удаляет legacy XML-функции перед `pg_restore --clean --single-transaction`.
 
 ## Профилирование

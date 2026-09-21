@@ -170,6 +170,10 @@ internal static class HostingPublisher
             LogProfile(state.BaselineId, "Контрольный снимок и сравнение хостинга — всего", phaseTimer,
                 $"объектов: {remoteSnapshot.Count:N0}");
 
+            phaseTimer.Restart();
+            await ExecuteAsync(local, "CALL berg_persistent.archive_invoices()");
+            LogProfile(state.BaselineId, "Архивация локальных счетов в berg_persistent", phaseTimer);
+
             success = true;
             Console.WriteLine("Полная публикация и проверка завершены успешно.");
             Console.WriteLine($"Baseline: {state.BaselineId}");
@@ -269,6 +273,13 @@ internal static class HostingPublisher
         if (reader.GetBoolean(0))
             throw new InvalidOperationException("PostgreSQL на хостинге находится в recovery mode.");
         Console.WriteLine($"Проверено подключение к хостингу: {reader.GetString(1)} / {reader.GetString(2)}");
+    }
+
+    private static async Task ExecuteAsync(NpgsqlConnection connection, string sql)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
     }
 
     private static async Task<SyncStateSnapshot> ReadStateAsync(NpgsqlConnection connection)

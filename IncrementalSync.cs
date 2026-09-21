@@ -221,6 +221,11 @@ internal static class IncrementalSync
             }
         }
 
+        phaseTimer.Restart();
+        Stage("Архивация локальных счетов");
+        await ExecuteAsync(postgres, "CALL berg_persistent.archive_invoices()", transaction);
+        LogProfile("Локальная архивация счетов в berg_persistent", phaseTimer);
+
         var countsJson = JsonSerializer.Serialize(packageCounts);
         var maxJson = JsonSerializer.Serialize(sourceMax);
 

@@ -252,6 +252,12 @@ done
 [[ "$delta_seq" == "0" ]] || die "Full restore must set delta_seq to 0"
 profile "Post-restore checks" "$PHASE_STARTED_MS"
 
+log "Archiving invoices in berg_persistent"
+PHASE_STARTED_MS="$(now_ms)"
+"$PSQL_BIN" -X -q -v ON_ERROR_STOP=1 -c \
+    "CALL berg_persistent.archive_invoices();"
+profile "berg_persistent invoice archival" "$PHASE_STARTED_MS"
+
 {
     printf 'restored_at=%s\n' "$(date --iso-8601=seconds)"
     printf 'archive=%s\n' "$ARCHIVE_NAME"
