@@ -19,6 +19,9 @@ try
         return 0;
     }
 
+    // Keep the OS file handle open across every await, including TUI and hosting publication.
+    using var runLock = RunLock.Acquire();
+
     var configuredMdbPath = options.Tui
         ? Environment.GetEnvironmentVariable("MDB_PATH")
         : !string.IsNullOrWhiteSpace(options.MdbPath)
