@@ -6,3 +6,4 @@ obj/
 .mcp.json
 delta-packages/
 artifacts/
+logs/

@@ -12,7 +12,8 @@ internal static class SyncTui
         OleDbConnection access,
         string mdbPath,
         string localConnectionString,
-        Options options)
+        Options options,
+        Action<string> recordLog)
     {
         if (!AnsiConsole.Profile.Capabilities.Interactive)
             throw new InvalidOperationException("TUI требует интерактивный терминал.");
@@ -41,6 +42,7 @@ internal static class SyncTui
                 .HighlightStyle(new Style(Color.Blue, decoration: Decoration.Bold))
                 .AddChoices(IncrementalMode, FullMode));
 
+        recordLog($"Режим TUI: {mode}; MDB: {mdbPath}");
         if (mode == FullMode)
             ValidateFullPublishingConfiguration();
 
@@ -57,6 +59,7 @@ internal static class SyncTui
         void ReportStage(string stage)
         {
             currentStage = stage;
+            recordLog($"Этап: {stage}");
             AnsiConsole.MarkupLine($"[blue]▶[/] [bold]{Markup.Escape(stage)}[/]");
         }
 
@@ -70,6 +73,7 @@ internal static class SyncTui
         }
         catch (Exception exception)
         {
+            recordLog($"Ошибка на этапе «{currentStage}»: {exception}");
             var message = $"[bold]Этап:[/] {Markup.Escape(currentStage)}\n" +
                           $"[bold]Ошибка:[/] {Markup.Escape(exception.Message)}";
             AnsiConsole.Write(new Panel(message)

@@ -6,11 +6,13 @@ using Npgsql;
 using NpgsqlTypes;
 
 Console.OutputEncoding = Encoding.UTF8;
+using var failureLog = new FailureLog();
 
 try
 {
     EnvironmentFile.Load();
     var options = Options.Parse(args);
+    failureLog.AddConnectionString(options.PgConnectionString);
     if (options.ShowHelp)
     {
         Options.PrintHelp();
@@ -33,8 +35,12 @@ try
     using var connection = OpenAccessDatabase(mdbPath, options.Provider);
 
     if (options.Tui)
-        return await SyncTui.RunAsync(
-            connection, mdbPath, ResolvePostgresConnectionString(options), options);
+    {
+        var result = await SyncTui.RunAsync(
+            connection, mdbPath, ResolvePostgresConnectionString(options), options, failureLog.Record);
+        if (result != 0) failureLog.Save();
+        return result;
+    }
 
     Console.WriteLine($"MDB: {mdbPath}");
     Console.WriteLine($"Размер: {new FileInfo(mdbPath).Length:N0} байт");
@@ -154,6 +160,7 @@ try
 catch (Exception exception)
 {
     Console.Error.WriteLine($"Ошибка: {exception.Message}");
+    failureLog.Save(exception);
 
     if (exception.Message.Contains("provider is not registered", StringComparison.OrdinalIgnoreCase) ||
         exception.Message.Contains("поставщик не зарегистрирован", StringComparison.OrdinalIgnoreCase))
