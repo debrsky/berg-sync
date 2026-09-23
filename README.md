@@ -250,11 +250,12 @@ dotnet run --project . -- --tui
 ```
 
 Для удалённого деплоя Windows CLI запустите **на рабочей станции**
-`scripts/deploy-remote-windows.ps1`. Адрес, порт, транспорт и имя пользователя
-берутся из пользовательского inventory `winrm-mcp` (по умолчанию хост `bergvl`).
-Пароля в inventory нет: скрипт читает локальную учётную запись `berg-winrm`
-из Windows Credential Manager (или принимает явно переданный `-Credential`),
-не выводя пароль.
+`scripts/deploy-remote-windows.ps1`. Скрипт не использует `winrm-mcp`:
+по умолчанию подключается к `192.168.179.10` по WinRM HTTP (порт 5985,
+путь `/wsman`). Другой адрес задаётся через `-ComputerName`, порт — `-Port`,
+HTTPS — `-UseSSL` (по умолчанию порт 5986). Имя пользователя и пароль скрипт
+читает из локальной учётной записи `berg-winrm` в Windows Credential Manager
+(или принимает явно переданный `-Credential`), не выводя пароль.
 Целевая машина должна быть Windows с включённым PowerShell Remoting (WinRM),
 доступной учётной записью с правом записи в каталог назначения, установленными
 .NET 10 и ACE OLE DB x64.
@@ -265,8 +266,8 @@ dotnet run --project . -- --tui
 .\scripts\deploy-remote-windows.ps1
 ```
 
-По умолчанию цель — `bergvl`, каталог — `C:\Tools\berg-sync`; для другого
-каталога используйте `-Destination <путь>`.
+По умолчанию цель — `192.168.179.10` (узел `bergvl`), каталог —
+`C:\Tools\berg-sync`; для другого каталога используйте `-Destination <путь>`.
 
 По умолчанию скрипт выполняет `dotnet publish` для win-x64, создаёт новый ZIP
 в `artifacts/` и публикует **именно этот** архив. Для сборки без деплоя есть

@@ -1,9 +1,10 @@
 ﻿# Run on the workstation. Build a fresh ZIP and deploy it to a Windows target via WinRM.
-# Uses the endpoint from the winrm-mcp inventory and the berg-winrm credential from Windows Credential Manager.
+# Uses explicit WinRM connection parameters and the berg-winrm credential from Windows Credential Manager.
 [CmdletBinding()]
 param(
-    [string]$SavedHost = 'bergvl',
-    [string]$InventoryPath = (Join-Path $env:APPDATA 'winrm-mcp\inventory.json'),
+    [string]$ComputerName = '192.168.179.10',
+    [int]$Port,
+    [switch]$UseSSL,
     [string]$Destination = 'C:\Tools\berg-sync',
     [string]$Archive,
     [string]$Sha256,
@@ -12,12 +13,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$inventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json
-$hostSettings = $inventory.hosts.PSObject.Properties[$SavedHost].Value
-if (-not $hostSettings) { throw "Хост '$SavedHost' отсутствует в inventory: $InventoryPath" }
-if ($hostSettings.auth -ne 'ntlm') { throw 'Скрипт поддерживает только NTLM из winrm-mcp inventory.' }
-$scheme = if ($hostSettings.ssl) { 'https' } else { 'http' }
-$uri = '{0}://{1}:{2}/{3}' -f $scheme, $hostSettings.host, $hostSettings.port, $hostSettings.path
+if ($Port -eq 0) { $Port = if ($UseSSL) { 5986 } else { 5985 } }
+if ($Port -lt 1 -or $Port -gt 65535) { throw 'Порт WinRM должен быть от 1 до 65535.' }
+$uriBuilder = [System.UriBuilder]::new(
+    $(if ($UseSSL) { 'https' } else { 'http' }), $ComputerName, $Port, 'wsman')
+$uri = $uriBuilder.Uri.AbsoluteUri
 $installer = Join-Path $PSScriptRoot 'deploy-windows.ps1'
 if (-not $BuildOnly -and -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Не найден скрипт установки: $installer"
@@ -66,8 +66,8 @@ Write-Host "SHA-256: $actualHash"
 if ($BuildOnly) { return }
 
 if (-not $Credential) {
-    # winrm-mcp inventory contains no password. Read the local user's Generic
-    # Windows Credential Manager entry without printing or passing the password.
+    # Read the local user's Generic Windows Credential Manager entry
+    # without printing or passing the password.
     if (-not ('BergCredentialManager' -as [type])) { Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -105,10 +105,6 @@ public static class BergCredentialManager {
     $Credential = [BergCredentialManager]::Read('berg-winrm')
     if (-not $Credential) { throw 'Не найдена учётная запись berg-winrm в Windows Credential Manager.' }
 }
-if ($Credential.UserName -ne $hostSettings.username) {
-    throw 'Пользователь сохранённой учётной записи не совпадает с winrm-mcp inventory.'
-}
-
 $session = $null
 $remoteDirectory = $null
 try {
@@ -122,7 +118,7 @@ try {
     } -ErrorAction Stop
     $remoteArchive = Join-Path $remoteDirectory 'berg-sync.zip'
     $remoteInstaller = Join-Path $remoteDirectory 'deploy-windows.ps1'
-    Write-Host "Передача артефакта на $SavedHost ($($hostSettings.host)) ..."
+    Write-Host "Передача артефакта на $ComputerName ..."
     Copy-Item -LiteralPath $archivePath -Destination $remoteArchive -ToSession $session -ErrorAction Stop
     Copy-Item -LiteralPath $installer -Destination $remoteInstaller -ToSession $session -ErrorAction Stop
 
