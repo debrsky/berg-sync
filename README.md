@@ -2,7 +2,8 @@
 
 Новая .NET-версия полной миграции Microsoft Access MDB в PostgreSQL и
 инкрементальной синхронизации. Проект никогда не изменяет MDB. PostgreSQL
-изменяется только при явном указании `--copy`, `--migrate` или `--incremental`.
+изменяется только при явном указании `--copy`, `--migrate`, `--incremental`
+или `--publish-hosting` (публикация заменяет схемы на хостинге).
 
 Документация:
 
@@ -52,7 +53,13 @@ cp .env.sample .env
 `HOSTING_TRANSFER_DIR`, `HOSTING_RESTORE_SCRIPT`, `PG_HOSTING_CONNECTION_STRING`,
 `HOSTING_SSH_KEY` (для Администратора) и `HOSTING_SSH_KEY_ZHN` (для zhn).
 В `.env` указываются абсолютные пути к ключам; приватные ключи в Git не добавляются.
-Файл `.env` игнорируется Git.
+Для полной публикации `ssh.exe` и `sftp.exe` используют общий `ssh/config` рядом с
+каталогом исполняемого файла (`app/../ssh/config` в установленной структуре).
+В нём задаются SSH-адрес и `known_hosts`, но не `IdentityFile`: ключ выбирается
+из `.env` по имени Windows-пользователя. При запуске из исходников через
+`dotnet run` конфиг нужно разместить в `ssh/config` на уровень выше каталога
+выходного exe (например, `bin/Debug/ssh/config` для `bin/Debug/net10.0-windows/berg-sync.exe`),
+иначе публикация не найдёт его. Файл `.env` игнорируется Git.
 
 ## Запуск из `C:\WORK\berg_sync`
 
