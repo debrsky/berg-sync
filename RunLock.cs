@@ -4,8 +4,7 @@ internal static class RunLock
     // The file is intentionally kept: removing it on exit would allow a race with another process.
     public static FileStream Acquire()
     {
-        var directory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "berg-sync");
+        var directory = Path.Combine(AppContext.BaseDirectory, "..", "state");
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "run.lock");
 

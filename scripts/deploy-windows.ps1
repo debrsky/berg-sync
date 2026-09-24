@@ -3,13 +3,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Archive,
-    [Parameter(Mandatory = $true)][string]$Destination,
+    [string]$Destination = 'C:\Tools\berg_sync\app',
     [string]$Sha256
 )
 
 $ErrorActionPreference = 'Stop'
 $archivePath = (Resolve-Path -LiteralPath $Archive).Path
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)
+if ([System.IO.Path]::GetFileName($destinationPath.TrimEnd('\', '/')) -ine 'app') {
+    throw 'Каталог назначения должен быть app: нельзя разворачивать архив в корень с секретами и рабочими данными.'
+}
 $parent = [System.IO.Path]::GetDirectoryName($destinationPath.TrimEnd('\', '/'))
 if (-not $parent) { throw 'Укажите каталог назначения, а не корень диска.' }
 if ($destinationPath.TrimEnd('\', '/') -eq $archivePath.TrimEnd('\', '/')) { throw 'Архив и назначение совпадают.' }
@@ -44,8 +47,8 @@ try {
     $files = @(Get-ChildItem -LiteralPath $staging -File -Recurse)
     foreach ($file in $files) {
         $relative = $file.FullName.Substring($staging.TrimEnd('\', '/').Length + 1)
-        if ($relative -eq '.env' -or $relative -like 'logs/*' -or $relative -like 'logs\*' -or
-            $relative -like 'delta-packages/*' -or $relative -like 'delta-packages\*') {
+        if ($relative -eq '.env' -or $relative -match '^(logs|delta-packages|ssh|state)([/\\]|$)' -or
+            $relative -match '(^|[/\\])\.env$' -or $relative -match '\.(key|pem|pfx)$') {
             throw "Архив содержит конфигурацию или пользовательские данные: $relative"
         }
     }
@@ -71,7 +74,7 @@ try {
     }
     Write-Host "Развёрнуто: $destinationPath"
     if (Test-Path -LiteralPath $backup) { Write-Host "Резервная копия заменённых файлов: $backup" }
-    Write-Host 'Конфигурация .env, logs/ и delta-packages/ не изменялись.'
+    Write-Host 'Конфигурация и рабочие каталоги в родительском каталоге app/ не изменялись.'
 }
 catch {
     $failure = $_

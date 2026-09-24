@@ -37,7 +37,7 @@ internal sealed class FailureLog : IDisposable
             if (error is not null) content += Environment.NewLine + error + Environment.NewLine;
             content = Redact(content);
 
-            var directory = Path.Combine(Directory.GetCurrentDirectory(), "logs");
+            var directory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "logs"));
             Directory.CreateDirectory(directory);
             var path = Path.Combine(directory,
                 $"berg-sync-error-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid():N}.log");

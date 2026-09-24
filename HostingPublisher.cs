@@ -195,8 +195,7 @@ internal static class HostingPublisher
     private static async Task EnsureRemoteDirectoryAsync(string target, string directory)
     {
         await RunProcessAsync("ssh.exe",
-            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target,
-             $"mkdir -p -- {ShellQuote(directory)}"]);
+            SshArguments(target, $"mkdir -p -- {ShellQuote(directory)}"));
     }
 
     private static async Task UploadWithResumeAsync(
@@ -211,8 +210,7 @@ internal static class HostingPublisher
             {
                 var exists = await RunProcessAsync(
                     "ssh.exe",
-                    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target,
-                     $"test -f {ShellQuote(remotePath)}"],
+                    SshArguments(target, $"test -f {ShellQuote(remotePath)}"),
                     throwOnError: false) == 0;
                 var operation = exists ? "reput" : "put";
                 await File.WriteAllTextAsync(
@@ -223,7 +221,7 @@ internal static class HostingPublisher
 
                 Console.WriteLine($"SFTP: попытка {attempt} из {attempts} ({operation})...");
                 var exitCode = await RunProcessAsync(
-                    "sftp.exe", ["-b", batchPath, target], throwOnError: false);
+                    "sftp.exe", SshArguments("-b", batchPath, target), throwOnError: false);
                 if (exitCode == 0)
                     return;
                 if (attempt < attempts)
@@ -258,7 +256,25 @@ internal static class HostingPublisher
 
         Console.WriteLine("Проверка SHA-256 и запуск удалённого восстановления...");
         await RunProcessAsync("ssh.exe",
-            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", target, command]);
+            SshArguments(target, command));
+    }
+
+    private static string[] SshArguments(params string[] arguments)
+    {
+        var configPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "ssh", "config"));
+        if (!File.Exists(configPath))
+            throw new FileNotFoundException("Не найден общий SSH-конфиг для публикации.", configPath);
+
+        var variable = Environment.UserName.Equals("zhn", StringComparison.OrdinalIgnoreCase)
+            ? "HOSTING_SSH_KEY_ZHN"
+            : "HOSTING_SSH_KEY";
+        var configuredKey = RequireEnvironment(variable);
+        var keyPath = Path.GetFullPath(configuredKey);
+        if (!File.Exists(keyPath))
+            throw new FileNotFoundException($"SSH-ключ из {variable} не найден.", keyPath);
+
+        return ["-F", configPath, "-i", keyPath, "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", .. arguments];
     }
 
     private static async Task ValidateHostingConnectionAsync(string connectionString)

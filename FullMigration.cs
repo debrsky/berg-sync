@@ -266,10 +266,15 @@ internal static class FullMigration
             return fullPath;
         }
 
+        var applicationSql = Path.Combine(AppContext.BaseDirectory, "sql");
+        if (File.Exists(Path.Combine(
+                applicationSql, "operations", "calculate-and-save-operations.sql")))
+            return applicationSql;
+
         var current = new DirectoryInfo(Directory.GetCurrentDirectory());
         while (current is not null)
         {
-            var candidate = Path.Combine(current.FullName, "SQL");
+            var candidate = Path.Combine(current.FullName, "sql");
             if (File.Exists(Path.Combine(
                     candidate, "operations", "calculate-and-save-operations.sql")))
                 return candidate;

@@ -5,7 +5,7 @@ param(
     [string]$ComputerName = '192.168.179.10',
     [int]$Port,
     [switch]$UseSSL,
-    [string]$Destination = 'C:\Tools\berg-sync',
+    [string]$Destination = 'C:\Tools\berg_sync\app',
     [string]$Archive,
     [string]$Sha256,
     [switch]$BuildOnly,
